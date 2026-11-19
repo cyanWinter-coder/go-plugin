@@ -63,6 +63,8 @@ func newGRPCClient(doneCtx context.Context, c *Client) (*GRPCClient, error) {
 
 	muxer, err := c.getGRPCMuxer(c.address)
 	if err != nil {
+		// Release the connection we just opened; nothing else owns it yet.
+		_ = conn.Close()
 		return nil, err
 	}
 
@@ -75,6 +77,10 @@ func newGRPCClient(doneCtx context.Context, c *Client) (*GRPCClient, error) {
 	// Start the stdio client
 	stdioClient, err := newGRPCStdioClient(doneCtx, c.logger.Named("stdio"), conn)
 	if err != nil {
+		// Tear down the broker and connection so their goroutines and sockets
+		// don't outlive this failed initialization.
+		_ = broker.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	go stdioClient.Run(c.config.SyncStdout, c.config.SyncStderr)

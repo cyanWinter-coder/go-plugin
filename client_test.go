@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2016, 2025
+// Copyright IBM Corp. 2016, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package plugin
@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -748,10 +749,333 @@ func TestClient_Start_Timeout(t *testing.T) {
 	c := NewClient(config)
 	defer c.Kill()
 
+	started := time.Now()
 	_, err := c.Start()
 	if err == nil {
 		t.Fatal("err should not be nil")
 	}
+
+	// Start must return within the configured timeout rather than waiting for
+	// the subprocess to exit on its own; the helper process sleeps for a
+	// minute before exiting.
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("Start took %s, should have returned within the start timeout", elapsed)
+	}
+}
+
+// TestClient_Start_Timeout_CleansUp verifies that a plugin which never
+// performs the handshake is terminated and released when Start times out.
+func TestClient_Start_Timeout_CleansUp(t *testing.T) {
+	runnerState := &fakeRunnerState{}
+	c := NewClient(&ClientConfig{
+		RunnerFunc: func(hclog.Logger, *exec.Cmd, string) (runner.Runner, error) {
+			return newFakeRunner(runnerState), nil
+		},
+		StartTimeout:    50 * time.Millisecond,
+		HandshakeConfig: testHandshake,
+		Plugins:         testPluginMap,
+	})
+	defer c.Kill()
+
+	started := time.Now()
+	if _, err := c.Start(); err == nil {
+		t.Fatal("err should not be nil")
+	}
+
+	// Start must return within the configured timeout, not wait for the
+	// process to exit on its own.
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("Start took %s, should have returned within the start timeout", elapsed)
+	}
+
+	// The subprocess must have been terminated and the client fully released.
+	waitFor(t, 5*time.Second, func() bool {
+		return runnerState.killed.Load() == 1
+	}, "runner was not killed after startup timeout")
+
+	if id := c.ID(); id != "" {
+		t.Fatalf("client still has a runner after cleanup: %q", id)
+	}
+
+	if _, err := c.Start(); err == nil {
+		t.Fatal("second Start should return the original startup error")
+	}
+}
+
+// TestClient_handshakeFailure_CleansUp verifies that a handshake failure tears
+// down the subprocess and leaves the client in a terminal error state.
+func TestClient_handshakeFailure_CleansUp(t *testing.T) {
+	runnerState := &fakeRunnerState{stdout: "this is not a handshake\n"}
+	c := NewClient(&ClientConfig{
+		RunnerFunc: func(hclog.Logger, *exec.Cmd, string) (runner.Runner, error) {
+			return newFakeRunner(runnerState), nil
+		},
+		StartTimeout:    5 * time.Second,
+		HandshakeConfig: testHandshake,
+		Plugins:         testPluginMap,
+	})
+	defer c.Kill()
+
+	_, err := c.Start()
+	if err == nil {
+		t.Fatal("err should not be nil")
+	}
+	if !strings.Contains(err.Error(), "Unrecognized remote plugin message") {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	// The subprocess must be killed, and a subsequent call must not start a
+	// new one or reuse the dead one.
+	if runnerState.killed.Load() != 1 {
+		t.Fatal("runner was not killed after handshake failure")
+	}
+
+	if _, err := c.Start(); err == nil {
+		t.Fatal("second Start should fail")
+	}
+	if runnerState.starts.Load() != 1 {
+		t.Fatalf("runner started %d times, expected 1", runnerState.starts.Load())
+	}
+}
+
+// TestClient_startFailure_ConcurrentKill verifies that a concurrent Kill and
+// startup failure release the resources exactly once.
+func TestClient_startFailure_ConcurrentKill(t *testing.T) {
+	runnerState := &fakeRunnerState{stdout: "this is not a handshake\n"}
+	c := NewClient(&ClientConfig{
+		RunnerFunc: func(hclog.Logger, *exec.Cmd, string) (runner.Runner, error) {
+			return newFakeRunner(runnerState), nil
+		},
+		StartTimeout:    5 * time.Second,
+		HandshakeConfig: testHandshake,
+		Plugins:         testPluginMap,
+	})
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = c.Start()
+		}()
+		go func() {
+			defer wg.Done()
+			c.Kill()
+		}()
+	}
+	wg.Wait()
+
+	if got := runnerState.killed.Load(); got != 1 {
+		t.Fatalf("runner killed %d times, expected exactly 1", got)
+	}
+	if got := runnerState.starts.Load(); got != 1 {
+		t.Fatalf("runner started %d times, expected exactly 1", got)
+	}
+}
+
+// TestClient_processExitConcurrentKill verifies that a process exiting on its
+// own at the same time as Kill still results in a single, clean teardown.
+func TestClient_processExitConcurrentKill(t *testing.T) {
+	runnerState := &fakeRunnerState{
+		stdout: fmt.Sprintf("%d|%d|tcp|:1234\n", CoreProtocolVersion, testHandshake.ProtocolVersion),
+	}
+	fake := newFakeRunner(runnerState)
+	c := NewClient(&ClientConfig{
+		RunnerFunc: func(hclog.Logger, *exec.Cmd, string) (runner.Runner, error) {
+			return fake, nil
+		},
+		StartTimeout:    5 * time.Second,
+		HandshakeConfig: testHandshake,
+		Plugins:         testPluginMap,
+		Logger:          hclog.NewNullLogger(),
+	})
+
+	if _, err := c.Start(); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		fake.exit()
+	}()
+	go func() {
+		defer wg.Done()
+		c.Kill()
+	}()
+	wg.Wait()
+
+	// Cleanup must have run exactly once even though both the process-exit
+	// watcher and Kill raced to tear the client down.
+	if got := runnerState.killed.Load(); got != 1 {
+		t.Fatalf("runner killed %d times, expected exactly 1", got)
+	}
+
+	waitFor(t, 5*time.Second, func() bool {
+		return c.Exited()
+	}, "client never observed the process exiting")
+
+	if id := c.ID(); id != "" {
+		t.Fatalf("client still has a runner after cleanup: %q", id)
+	}
+
+	// A later Kill must be a harmless no-op.
+	c.Kill()
+}
+
+// TestClient_connectFailure_CleansUp verifies that a failure to establish the
+// protocol connection after a successful handshake also tears the subprocess
+// down through the same cleanup path.
+func TestClient_connectFailure_CleansUp(t *testing.T) {
+	// Advertise an address nothing is listening on so the net/rpc dial fails.
+	runnerState := &fakeRunnerState{
+		stdout: fmt.Sprintf("%d|%d|tcp|127.0.0.1:1\n", CoreProtocolVersion, testHandshake.ProtocolVersion),
+	}
+	fake := newFakeRunner(runnerState)
+	c := NewClient(&ClientConfig{
+		RunnerFunc: func(hclog.Logger, *exec.Cmd, string) (runner.Runner, error) {
+			return fake, nil
+		},
+		StartTimeout:    5 * time.Second,
+		HandshakeConfig: testHandshake,
+		Plugins:         testPluginMap,
+		Logger:          hclog.NewNullLogger(),
+	})
+	defer c.Kill()
+
+	if _, err := c.Start(); err != nil {
+		t.Fatalf("handshake should succeed, got: %s", err)
+	}
+
+	if _, err := c.Client(); err == nil {
+		t.Fatal("expected the protocol connection to fail")
+	}
+
+	// Establishing the protocol connection failed, so the process must be
+	// killed exactly once and the runner reference cleared.
+	waitFor(t, 5*time.Second, func() bool {
+		return runnerState.killed.Load() == 1
+	}, "runner was not killed after protocol connection failure")
+
+	if id := c.ID(); id != "" {
+		t.Fatalf("client still has a runner after cleanup: %q", id)
+	}
+
+	// Repeated calls keep returning an error without starting anything new.
+	if _, err := c.Client(); err == nil {
+		t.Fatal("expected subsequent Client calls to fail")
+	}
+	if got := runnerState.starts.Load(); got != 1 {
+		t.Fatalf("runner started %d times, expected exactly 1", got)
+	}
+}
+
+// fakeRunnerState records interactions with a fakeRunner across the runner
+// and client goroutines.
+type fakeRunnerState struct {
+	stdout string
+
+	starts atomic.Int64
+	killed atomic.Int64
+}
+
+// fakeRunner implements runner.Runner for controller-driven tests.
+type fakeRunner struct {
+	state *fakeRunnerState
+
+	stdout io.ReadCloser
+	stderr io.ReadCloser
+
+	// stdoutW and stderrW are the write ends, closed when the runner is killed
+	// or the process exits so the client's pipe readers observe EOF.
+	stdoutW io.WriteCloser
+	stderrW io.WriteCloser
+
+	waitCh   chan struct{}
+	waitOnce sync.Once
+}
+
+func newFakeRunner(state *fakeRunnerState) *fakeRunner {
+	stdoutR, stdoutW := io.Pipe()
+	stderrR, stderrW := io.Pipe()
+
+	r := &fakeRunner{
+		state:   state,
+		stdout:  stdoutR,
+		stderr:  stderrR,
+		stdoutW: stdoutW,
+		stderrW: stderrW,
+		waitCh:  make(chan struct{}),
+	}
+
+	// Emit the configured stdout, then keep the pipe open so the client's
+	// scanner and Wait() keep running until the runner is killed.
+	go func() {
+		if state.stdout != "" {
+			_, _ = stdoutW.Write([]byte(state.stdout))
+		}
+		<-r.waitCh
+		_ = stdoutW.Close()
+	}()
+
+	return r
+}
+
+func (r *fakeRunner) Start(context.Context) error {
+	r.state.starts.Add(1)
+	return nil
+}
+
+func (r *fakeRunner) Wait(context.Context) error {
+	<-r.waitCh
+	return nil
+}
+
+func (r *fakeRunner) Kill(context.Context) error {
+	r.state.killed.Add(1)
+	r.exit()
+	return nil
+}
+
+// exit simulates the process terminating on its own, without a kill.
+func (r *fakeRunner) exit() {
+	r.waitOnce.Do(func() {
+		// Close the pipes so the client's stdout/stderr readers observe EOF
+		// and can exit, mirroring what happens when a real process dies.
+		_ = r.stderrW.Close()
+		close(r.waitCh)
+	})
+}
+
+func (r *fakeRunner) Stdout() io.ReadCloser { return r.stdout }
+func (r *fakeRunner) Stderr() io.ReadCloser { return r.stderr }
+func (r *fakeRunner) Name() string          { return "fake" }
+func (r *fakeRunner) ID() string            { return "fake" }
+
+func (r *fakeRunner) PluginToHost(network, addr string) (string, string, error) {
+	return network, addr, nil
+}
+
+func (r *fakeRunner) HostToPlugin(network, addr string) (string, string, error) {
+	return network, addr, nil
+}
+
+func (r *fakeRunner) Diagnose(context.Context) string { return "" }
+
+// waitFor polls cond until it returns true or the deadline expires.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Fatal(msg)
 }
 
 func TestClient_Stderr(t *testing.T) {

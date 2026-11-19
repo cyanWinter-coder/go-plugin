@@ -1,4 +1,4 @@
-// Copyright IBM Corp. 2016, 2025
+// Copyright IBM Corp. 2016, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package plugin
@@ -72,6 +72,7 @@ func NewRPCClient(conn io.ReadWriteCloser, plugins map[string]Plugin) (*RPCClien
 	// Connect to the control stream.
 	control, err := mux.Open()
 	if err != nil {
+		_ = conn.Close()
 		_ = mux.Close()
 		return nil, err
 	}
@@ -81,6 +82,7 @@ func NewRPCClient(conn io.ReadWriteCloser, plugins map[string]Plugin) (*RPCClien
 	for i := range stdstream {
 		stdstream[i], err = mux.Open()
 		if err != nil {
+			_ = conn.Close()
 			_ = mux.Close()
 			return nil, err
 		}

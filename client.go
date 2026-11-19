@@ -75,6 +75,13 @@ var (
 // defaultPluginLogBufferSize is the default size of the buffer used to read from stderr for plugin log lines.
 const defaultPluginLogBufferSize = 64 * 1024
 
+// cleanupGracePeriod is the minimum amount of time allowed for terminating a
+// plugin process and letting its goroutines exit after a failed startup.
+// Without it, a startup that consumed its entire StartTimeout would have no
+// budget left for cleanup and could block indefinitely on an unresponsive
+// process.
+const cleanupGracePeriod = 2 * time.Second
+
 // Client handles the lifecycle of a plugin application. It launches
 // plugins, connects to them, dispenses interface implementations, and handles
 // killing the process.
@@ -111,10 +118,37 @@ type Client struct {
 	// forcefully killed.
 	processKilled bool
 
+	// cleanedUp is set once releaseResources has run. It is protected by c.l.
+	cleanedUp bool
+
 	unixSocketCfg UnixSocketConfig
 
-	grpcMuxerOnce sync.Once
-	grpcMuxer     *grpcmux.GRPCClientMuxer
+	grpcMuxerMu     sync.Mutex
+	grpcMuxer       *grpcmux.GRPCClientMuxer
+	grpcMuxerClosed bool
+
+	// startMu serializes Start calls. Unlike c.l, it is held for the whole
+	// duration of startup, which allows the failure path to release c.l before
+	// running cleanup.
+	startMu sync.Mutex
+
+	// killMu serializes Kill calls.
+	killMu sync.Mutex
+
+	// clientMu serializes creation and shutdown of the protocol client so a
+	// concurrent Kill can't close it while Client is building it.
+	clientMu sync.Mutex
+
+	// cleanupOnce ensures that the resources acquired while starting the
+	// plugin are released exactly once. Startup failures and Kill can race to
+	// tear the client down.
+	cleanupOnce sync.Once
+
+	// startErr records the error from the first failed Start. A client that
+	// failed to start cannot be started again, so subsequent calls return the
+	// same error instead of reusing a subprocess that has already been torn
+	// down. It is protected by c.l.
+	startErr error
 }
 
 // NegotiatedVersion returns the protocol version negotiated with the server.
@@ -443,11 +477,40 @@ func NewClient(config *ClientConfig) (c *Client) {
 //
 // Subsequent calls to this will return the same client.
 func (c *Client) Client() (ClientProtocol, error) {
-	_, err := c.Start()
-	if err != nil {
+	if _, err := c.Start(); err != nil {
 		return nil, err
 	}
 
+	// Serialize client creation with Kill, which may simultaneously be
+	// shutting the protocol client down.
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+
+	client, err := c.newProtocolClient()
+	if err != nil {
+		// The plugin process is running but we couldn't establish the
+		// protocol connection (for example, the stdio stream failed to
+		// initialize). Tear the process and any partially created resources
+		// down through the same path used for startup failures, and remember
+		// the error so later calls don't retry against a torn-down process.
+		c.l.Lock()
+		if c.startErr == nil {
+			c.startErr = err
+		}
+		c.l.Unlock()
+
+		deadline := time.Now().Add(c.config.StartTimeout)
+		c.cleanupFailedStart(deadline)
+		return nil, err
+	}
+
+	return client, nil
+}
+
+// newProtocolClient returns the cached protocol client, creating it if
+// necessary. The address and protocol must already have been negotiated by
+// Start.
+func (c *Client) newProtocolClient() (ClientProtocol, error) {
 	c.l.Lock()
 	defer c.l.Unlock()
 
@@ -455,6 +518,16 @@ func (c *Client) Client() (ClientProtocol, error) {
 		return c.client, nil
 	}
 
+	if c.cleanedUp || c.startErr != nil {
+		// The client has already been torn down; don't start a new protocol
+		// client against a process that is no longer running.
+		if c.startErr != nil {
+			return nil, c.startErr
+		}
+		return nil, fmt.Errorf("plugin client has been closed")
+	}
+
+	var err error
 	switch c.protocol {
 	case ProtocolNetRPC:
 		c.client, err = newRPCClient(c)
@@ -474,7 +547,18 @@ func (c *Client) Client() (ClientProtocol, error) {
 	return c.client, nil
 }
 
-// Tells whether or not the underlying process has exited.
+// takeProtocolClient atomically returns the current protocol client and clears
+// the reference, so that it is only closed once.
+func (c *Client) takeProtocolClient() ClientProtocol {
+	c.l.Lock()
+	defer c.l.Unlock()
+
+	client := c.client
+	c.client = nil
+	return client
+}
+
+// Exited tells whether or not the underlying process has exited.
 func (c *Client) Exited() bool {
 	c.l.Lock()
 	defer c.l.Unlock()
@@ -496,32 +580,31 @@ func (c *Client) killed() bool {
 //
 // This method can safely be called multiple times.
 func (c *Client) Kill() {
+	// Serialize Kill calls so a concurrent Kill and process exit don't both
+	// attempt a graceful shutdown. releaseResources is also guarded by a
+	// sync.Once, so cleanup happens exactly once either way.
+	c.killMu.Lock()
+	defer c.killMu.Unlock()
+
 	// Grab a lock to read some private fields.
 	c.l.Lock()
 	runner := c.runner
 	addr := c.address
-	hostSocketDir := c.unixSocketCfg.socketDir
+	cleanedUp := c.cleanedUp
 	c.l.Unlock()
 
-	// If there is no runner or ID, there is nothing to kill.
-	if runner == nil || runner.ID() == "" {
+	// If the client has already been cleaned up, or there is no runner with an
+	// ID, there is nothing left to kill. Resources acquired by a failed
+	// startup are handled by the startup path itself, and test-mode reattach
+	// clients deliberately leave the plugin running and usable.
+	if cleanedUp || runner == nil || runner.ID() == "" {
+		if cleanedUp {
+			// Cleanup already ran; give its goroutines a bounded chance to
+			// finish without blocking on a process that never exits.
+			c.waitForGoroutines(time.Now().Add(cleanupGracePeriod))
+		}
 		return
 	}
-
-	defer func() {
-		// Wait for the all client goroutines to finish.
-		c.clientWaitGroup.Wait()
-
-		if hostSocketDir != "" {
-			_ = os.RemoveAll(hostSocketDir)
-		}
-
-		// Make sure there is no reference to the old process after it has been
-		// killed.
-		c.l.Lock()
-		c.runner = nil
-		c.l.Unlock()
-	}()
 
 	// We need to check for address here. It is possible that the plugin
 	// started (process != nil) but has no address (addr == nil) if the
@@ -529,9 +612,11 @@ func (c *Client) Kill() {
 	// the plugin net connections.
 	graceful := false
 	if addr != nil {
-		// Close the client to cleanly exit the process.
-		client, err := c.Client()
-		if err == nil {
+		// Close the client to cleanly exit the process. The client is taken
+		// out of the Client first so the cleanup path can't close it a second
+		// time.
+		client, err := c.takeClientForShutdown()
+		if err == nil && client != nil {
 			err = client.Close()
 
 			// If there is no error, then we attempt to wait for a graceful
@@ -543,7 +628,7 @@ func (c *Client) Kill() {
 				// kill in a moment anyways.
 				c.logger.Warn("error closing client during Kill", "err", err)
 			}
-		} else {
+		} else if err != nil {
 			c.logger.Error("client", "error", err)
 		}
 	}
@@ -555,6 +640,10 @@ func (c *Client) Kill() {
 		select {
 		case <-c.doneCtx.Done():
 			c.logger.Debug("plugin exited")
+			// The process exited on its own, so release the remaining
+			// resources without killing it.
+			c.releaseResources(false, time.Time{})
+			c.waitForGoroutines(time.Time{})
 			return
 		case <-time.After(2 * time.Second):
 		}
@@ -562,13 +651,134 @@ func (c *Client) Kill() {
 
 	// If graceful exiting failed, just kill it
 	c.logger.Warn("plugin failed to exit gracefully")
-	if err := runner.Kill(context.Background()); err != nil {
-		c.logger.Debug("error killing plugin", "error", err)
+	c.releaseResources(true, time.Time{})
+	c.waitForGoroutines(time.Time{})
+}
+
+// takeClientForShutdown returns the protocol client that should be shut down
+// gracefully before the plugin process is killed, creating it if necessary. It
+// removes the client from the Client so that releaseResources won't close it
+// again.
+func (c *Client) takeClientForShutdown() (ClientProtocol, error) {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+
+	if client := c.takeProtocolClient(); client != nil {
+		return client, nil
 	}
 
-	c.l.Lock()
-	c.processKilled = true
-	c.l.Unlock()
+	if _, err := c.newProtocolClient(); err != nil {
+		return nil, err
+	}
+
+	return c.takeProtocolClient(), nil
+}
+
+// releaseResources releases the process and protocol resources acquired by
+// Start and Client. It is safe to call concurrently from the startup failure
+// path and Kill: the work is performed exactly once.
+//
+// If kill is true, the runner is asked to stop the plugin. The deadline bounds
+// how long the kill call may take; a zero deadline means no bound. It must not
+// be called while holding c.l.
+func (c *Client) releaseResources(kill bool, deadline time.Time) {
+	c.cleanupOnce.Do(func() {
+		c.l.Lock()
+		c.cleanedUp = true
+		client := c.client
+		c.client = nil
+		runner := c.runner
+		c.runner = nil
+		socketDir := c.unixSocketCfg.socketDir
+		c.l.Unlock()
+
+		// Cancel the done context first: it unblocks Start (if it is waiting
+		// for the plugin), gRPC shutdown calls, and the broker goroutines.
+		if c.ctxCancel != nil {
+			c.ctxCancel()
+		}
+
+		// Close the protocol connection so the broker and stdio goroutines
+		// stop and any sockets are released.
+		c.closeProtocolClient(client)
+		c.closeGRPCMuxer()
+
+		if kill && runner != nil {
+			killCtx := context.Background()
+			if !deadline.IsZero() {
+				var cancel context.CancelFunc
+				killCtx, cancel = context.WithDeadline(killCtx, deadline)
+				defer cancel()
+			}
+
+			if err := runner.Kill(killCtx); err != nil {
+				c.logger.Debug("error killing plugin", "error", err)
+			}
+
+			c.l.Lock()
+			c.processKilled = true
+			c.l.Unlock()
+		}
+
+		if socketDir != "" {
+			_ = os.RemoveAll(socketDir)
+		}
+	})
+}
+
+// closeProtocolClient closes the protocol client, if it hasn't been closed
+// already.
+func (c *Client) closeProtocolClient(client ClientProtocol) {
+	if client == nil {
+		return
+	}
+
+	if err := client.Close(); err != nil {
+		c.logger.Debug("error closing protocol client", "error", err)
+	}
+}
+
+// closeGRPCMuxer closes the gRPC broker muxer if it was created. Once closed,
+// the muxer is never recreated.
+func (c *Client) closeGRPCMuxer() {
+	c.grpcMuxerMu.Lock()
+	muxer := c.grpcMuxer
+	c.grpcMuxer = nil
+	c.grpcMuxerClosed = true
+	c.grpcMuxerMu.Unlock()
+
+	if muxer != nil {
+		_ = muxer.Close()
+	}
+}
+
+// waitForGoroutines waits for the client goroutines to exit. A zero deadline
+// waits indefinitely; otherwise the wait is bounded, which keeps startup
+// failures from blocking forever on a process that refuses to exit.
+func (c *Client) waitForGoroutines(deadline time.Time) {
+	if deadline.IsZero() {
+		c.clientWaitGroup.Wait()
+		return
+	}
+
+	doneCh := make(chan struct{})
+	go func() {
+		c.clientWaitGroup.Wait()
+		close(doneCh)
+	}()
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return
+	}
+
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+
+	select {
+	case <-doneCh:
+	case <-timer.C:
+	}
 }
 
 // Start the underlying subprocess, communicating with it to negotiate
@@ -578,13 +788,99 @@ func (c *Client) Kill() {
 // Once a client has been started once, it cannot be started again, even if
 // it was killed.
 func (c *Client) Start() (addr net.Addr, err error) {
+	// Serialize startup attempts. This is separate from c.l so that the
+	// failure path can release c.l before tearing the client down.
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+
+	// All startup errors, including panics, go through the same cleanup path.
+	// Cleanup is bounded by the start deadline so a plugin that refuses to
+	// exit can't keep Start from returning.
+	startDeadline := time.Now().Add(c.config.StartTimeout)
+	locked := false
+	failed := false
+	defer func() {
+		rErr := recover()
+
+		if locked {
+			c.l.Unlock()
+		}
+
+		if failed || rErr != nil {
+			c.cleanupFailedStart(startDeadline)
+		}
+
+		if rErr != nil {
+			panic(rErr)
+		}
+	}()
+
 	c.l.Lock()
-	defer c.l.Unlock()
+	locked = true
 
 	if c.address != nil {
 		return c.address, nil
 	}
 
+	if c.startErr != nil {
+		// A previous Start failed and already tore down the subprocess.
+		// Starting again would reuse a client that is no longer viable.
+		return nil, c.startErr
+	}
+
+	addr, err = c.startLocked()
+	if err != nil {
+		failed = true
+		if c.startErr == nil {
+			c.startErr = err
+		}
+		return nil, err
+	}
+
+	locked = false
+	c.l.Unlock()
+	return addr, nil
+}
+
+// cleanupFailedStart releases every resource acquired by a failed startup and
+// terminates the subprocess. It must not be called while holding c.l.
+//
+// Start waits for cleanup only until the startup deadline, so a plugin that
+// refuses to exit can never keep the caller blocked past StartTimeout. The
+// cleanup itself keeps running in the background with its own short grace
+// period, so the process is still terminated even when startup consumed the
+// entire budget.
+func (c *Client) cleanupFailedStart(deadline time.Time) {
+	killDeadline := deadline
+	if minDeadline := time.Now().Add(cleanupGracePeriod); killDeadline.Before(minDeadline) {
+		killDeadline = minDeadline
+	}
+
+	doneCh := make(chan struct{})
+	go func() {
+		defer close(doneCh)
+		c.releaseResources(true, killDeadline)
+		c.waitForGoroutines(killDeadline)
+	}()
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		c.logger.Debug("startup deadline exceeded, cleaning up plugin in background")
+		return
+	}
+
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+
+	select {
+	case <-doneCh:
+	case <-timer.C:
+		c.logger.Debug("timed out waiting for plugin cleanup after failed startup")
+	}
+}
+
+// startLocked performs the actual startup sequence. The caller must hold c.l.
+func (c *Client) startLocked() (addr net.Addr, err error) {
 	// If one of cmd or reattach isn't set, then it is an error. We wrap
 	// this in a {} for scoping reasons, and hopeful that the escape
 	// analysis will pop the stack here.
@@ -730,28 +1026,21 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	}
 
 	c.runner = runner
+
+	// Create the context used to signal shutdown before the process is
+	// started, so that a concurrent Kill or startup failure can always cancel
+	// it and unblock any goroutines waiting on the plugin.
+	c.doneCtx, c.ctxCancel = context.WithCancel(context.Background())
+
 	startCtx, startCtxCancel := context.WithTimeout(context.Background(), c.config.StartTimeout)
 	defer startCtxCancel()
-	err = runner.Start(startCtx)
-	if err != nil {
+	if err = runner.Start(startCtx); err != nil {
 		return nil, err
 	}
 
-	// Make sure the command is properly cleaned up if there is an error
-	defer func() {
-		rErr := recover()
-
-		if err != nil || rErr != nil {
-			_ = runner.Kill(context.Background())
-		}
-
-		if rErr != nil {
-			panic(rErr)
-		}
-	}()
-
-	// Create a context for when we kill
-	c.doneCtx, c.ctxCancel = context.WithCancel(context.Background())
+	// From here on, any error (or panic) is handled by Start's deferred
+	// cleanup, which terminates the runner and releases everything Start and
+	// Client may have created.
 
 	// Add two to pipesWaitGroup: one for logStderr, one for the goroutine
 	// below that consumes Stdout.  We mustn't continue to Add once we might Wait.
@@ -786,8 +1075,8 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 		// Set that we exited, which takes a lock
 		c.l.Lock()
-		defer c.l.Unlock()
 		c.exited = true
+		c.l.Unlock()
 	}()
 
 	// Start a goroutine that is going to be reading the lines
@@ -1155,15 +1444,26 @@ func (c *Client) getGRPCMuxer(addr net.Addr) (*grpcmux.GRPCClientMuxer, error) {
 		return nil, nil
 	}
 
-	var err error
-	c.grpcMuxerOnce.Do(func() {
-		c.grpcMuxer, err = grpcmux.NewGRPCClientMuxer(c.logger, addr)
-	})
+	c.grpcMuxerMu.Lock()
+	defer c.grpcMuxerMu.Unlock()
+
+	if c.grpcMuxerClosed {
+		// The client has been torn down; don't recreate a muxer that would
+		// otherwise leak its connection and goroutines.
+		return nil, fmt.Errorf("gRPC broker muxer is closed")
+	}
+
+	if c.grpcMuxer != nil {
+		return c.grpcMuxer, nil
+	}
+
+	muxer, err := grpcmux.NewGRPCClientMuxer(c.logger, addr)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.grpcMuxer, nil
+	c.grpcMuxer = muxer
+	return muxer, nil
 }
 
 func (c *Client) logStderr(name string, r io.Reader) {
