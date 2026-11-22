@@ -115,6 +115,12 @@ type Client struct {
 
 	grpcMuxerOnce sync.Once
 	grpcMuxer     *grpcmux.GRPCClientMuxer
+
+	// discoveryRecord is the versioned lifecycle record claimed by this client
+	// when ClientConfig.DiscoveryRegistry is set. It is nil on the legacy path
+	// and on reattach clients, which receive their record through
+	// ReattachConfig.DiscoveryRecord instead.
+	discoveryRecord *DiscoveryRecord
 }
 
 // NegotiatedVersion returns the protocol version negotiated with the server.
@@ -274,6 +280,22 @@ type ClientConfig struct {
 	// UnixSocketConfig configures additional options for any Unix sockets
 	// that are created. Not normally required. Not supported on Windows.
 	UnixSocketConfig *UnixSocketConfig
+
+	// DiscoveryRegistry, when non-nil, records this client's plugin in the
+	// versioned discovery lifecycle. A record is claimed when the process
+	// starts and becomes the current (reattachable) record only after the full
+	// handshake commits; on Kill the record is tombstoned and its resources are
+	// reclaimed under the registry's bounded cleanup. When nil, the client uses
+	// the legacy PID/port behavior and no record is written.
+	//
+	// Reattach clients do not use this field: they are built from a record
+	// obtained via DiscoveryRegistry.Reattach (see ReattachConfig).
+	DiscoveryRegistry *DiscoveryRegistry
+
+	// DiscoveryIdentity is the program identity recorded when
+	// DiscoveryRegistry is set. It is ignored when the registry is nil or when
+	// Reattach is set.
+	DiscoveryIdentity PluginIdentity
 }
 
 type UnixSocketConfig struct {
@@ -312,6 +334,13 @@ type ReattachConfig struct {
 	// process and instead will rely on the plugin to terminate itself. This
 	// should not be used in non-test environments.
 	Test bool
+
+	// DiscoveryRecord is the validated lifecycle record backing this reattach,
+	// as returned by DiscoveryRegistry.Reattach or ReattachGeneration. When it
+	// is set, client.Kill tombstones the record through the registry instead
+	// of relying on PID/port bookkeeping. It does not by itself make a record
+	// reattachable: the registry has already decided that before returning it.
+	DiscoveryRecord *DiscoveryRecord
 }
 
 // SecureConfig is used to configure a client to verify the integrity of an
@@ -569,6 +598,40 @@ func (c *Client) Kill() {
 	c.l.Lock()
 	c.processKilled = true
 	c.l.Unlock()
+
+	c.tombstoneDiscoveryRecord()
+}
+
+// tombstoneDiscoveryRecord moves this client's discovery record (or the record
+// backing a reattach) to the tombstoned state. The record becomes
+// un-reattachable immediately; the registry runs the bounded resource cleanup
+// asynchronously so Kill is not blocked by an unresponsive filesystem. It is a
+// no-op on the legacy path where no registry was configured.
+func (c *Client) tombstoneDiscoveryRecord() {
+	var registry *DiscoveryRegistry
+	var rec *DiscoveryRecord
+
+	switch {
+	case c.discoveryRecord != nil:
+		registry = c.config.DiscoveryRegistry
+		rec = c.discoveryRecord
+	case c.config.Reattach != nil && c.config.Reattach.DiscoveryRecord != nil:
+		// Reattach clients are not given the registry directly; the record
+		// carries it for the duration of the lifecycle through the config's
+		// reference, resolved by the caller via ReattachConfigFromRecord.
+		registry = c.config.Reattach.DiscoveryRecord.registry
+		rec = c.config.Reattach.DiscoveryRecord
+	}
+
+	if registry == nil || rec == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), registry.cfg.CleanupTimeout)
+	defer cancel()
+	if err := registry.Tombstone(ctx, rec.Identity, rec.Generation); err != nil {
+		c.logger.Warn("tombstoning plugin discovery record", "generation", rec.Generation, "error", err)
+	}
 }
 
 // Start the underlying subprocess, communicating with it to negotiate
@@ -730,11 +793,32 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	}
 
 	c.runner = runner
+
 	startCtx, startCtxCancel := context.WithTimeout(context.Background(), c.config.StartTimeout)
 	defer startCtxCancel()
 	err = runner.Start(startCtx)
 	if err != nil {
 		return nil, err
+	}
+
+	// When discovery is enabled, claim the next generation only after the
+	// process has started, so the record captures the real runner ID (PID or
+	// container ID). The record stays pending (and un-reattachable) until the
+	// full handshake commits below, so a crash during startup can never be
+	// mistaken for the running plugin.
+	if c.config.DiscoveryRegistry != nil && c.config.Reattach == nil {
+		claimCtx, claimCancel := context.WithTimeout(context.Background(), c.config.StartTimeout)
+		rec, claimErr := c.config.DiscoveryRegistry.Claim(claimCtx, ClaimOptions{
+			Identity:  c.config.DiscoveryIdentity,
+			RunnerID:  runner.ID(),
+			Resources: discoveryResources(&c.unixSocketCfg),
+		})
+		claimCancel()
+		if claimErr != nil {
+			_ = runner.Kill(context.Background())
+			return nil, fmt.Errorf("claiming plugin discovery record: %w", claimErr)
+		}
+		c.discoveryRecord = rec
 	}
 
 	// Make sure the command is properly cleaned up if there is an error
@@ -743,6 +827,19 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 		if err != nil || rErr != nil {
 			_ = runner.Kill(context.Background())
+			// A claimed record that never reached Commit must not linger: it is
+			// pending, un-reattachable, and owns resources (e.g. a socket
+			// directory) that need reclaiming. Tombstone it and let bounded
+			// cleanup run asynchronously; failure here must not mask the
+			// startup error.
+			if c.discoveryRecord != nil {
+				tombstoneCtx, tombstoneCancel := context.WithTimeout(context.Background(), c.config.StartTimeout)
+				if tombErr := c.config.DiscoveryRegistry.Tombstone(tombstoneCtx,
+					c.discoveryRecord.Identity, c.discoveryRecord.Generation); tombErr != nil {
+					c.logger.Warn("tombstoning uncommitted discovery record", "error", tombErr)
+				}
+				tombstoneCancel()
+			}
 		}
 
 		if rErr != nil {
@@ -944,6 +1041,29 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	}
 
 	c.address = addr
+
+	// The full handshake succeeded. Commit is the only step that makes the
+	// record current and reattachable; the previously active generation, if
+	// any, is tombstoned only at this point, so a failed upgrade leaves the
+	// old version serving traffic.
+	if c.discoveryRecord != nil {
+		commitCtx, commitCancel := context.WithTimeout(context.Background(), c.config.StartTimeout)
+		committed, commitErr := c.config.DiscoveryRegistry.Commit(
+			commitCtx,
+			c.discoveryRecord.Identity,
+			c.discoveryRecord.Generation,
+			HandshakeResult{
+				Network: addr.Network(),
+				Address: addr.String(),
+			},
+		)
+		commitCancel()
+		if commitErr != nil {
+			err = fmt.Errorf("committing plugin discovery record: %w", commitErr)
+			return nil, err
+		}
+		c.discoveryRecord = committed
+	}
 	return
 }
 

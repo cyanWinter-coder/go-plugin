@@ -4,6 +4,14 @@ SECURITY:
 * deps: Updated google.golang.org/grpc to v1.81.1 [[GH-383](https://github.com/hashicorp/go-plugin/pull/383)]
 
 ENHANCEMENTS:
+* Added an opt-in versioned discovery lifecycle (`NewRegistry`,
+  `ClientConfig.DiscoveryRegistry`) that keys reattachable plugin records by
+  program identity, protocol version and start generation instead of PID and
+  port. A new generation replaces the current record only after a full
+  handshake, tombstoned and expired records can never be reattached, and
+  resource cleanup is bounded, idempotent and re-driven after a host restart.
+  Legacy `Discover`, runner and reattach behavior is unchanged when not
+  configured.
 * deps: Removed direct use of deprecated `github.com/golang/protobuf` in favour of `google.golang.org/protobuf` [[GH-388](https://github.com/hashicorp/go-plugin/pull/388)]
 
 ## v1.7.0

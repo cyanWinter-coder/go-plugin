@@ -75,6 +75,15 @@ reattach.
 checksum and RPC communications can be configured to use TLS. The host process
 must be properly secured to protect this configuration.
 
+**Versioned discovery lifecycle.** Reattachment can be backed by a persisted
+record of each plugin's program identity, protocol version and start
+generation rather than by PID and port alone, so an upgrade or a reused port
+can never bind the host to a stale instance. Records move through a one-way
+state machine (pending → active → tombstoned → cleaned), new generations
+replace the current record only after a full handshake, and resource cleanup is
+bounded and survives host restarts. See the
+[discovery lifecycle documentation](docs/discovery-lifecycle.md).
+
 ## Architecture
 
 The HashiCorp plugin system works by launching subprocesses and communicating
