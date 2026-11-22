@@ -246,19 +246,25 @@ func (s *gRPCBrokerClientImpl) Close() {
 	})
 }
 
-// GRPCBroker is responsible for brokering connections by unique ID.
-//
-// It is used by plugins to create multiple gRPC connections and data
-// streams between the plugin process and the host process.
-//
-// This allows a plugin to request a channel with a specific ID to connect to
-// or accept a connection from, and the broker handles the details of
-// holding these channels open while they're being negotiated.
-//
-// The Plugin interface has access to these for both Server and Client.
-// The broker can be used by either (optionally) to reserve and connect to
-// new streams. This is useful for complex args and return values,
-// or anything else you might need a data stream for.
+// negotiateTimeout is how long a Dial or knock handshake waits for the peer to
+// answer before giving up.
+const negotiateTimeout = 5 * time.Second
+
+// defaultDrainTimeout bounds how long a finished broker stream keeps its
+// stream ID fenced off after its terminal state has been published. During the
+// drain window any late frames belonging to the old generation are absorbed and
+// dropped, so the ID cannot be handed to a new call until the old frame can no
+// longer reach a live waiter. The value is stored on GRPCBroker.drainTimeout so
+// tests can shorten it.
+const defaultDrainTimeout = time.Second
+
+// errBrokerClosed is published to waiters once the broker has been shut down.
+var errBrokerClosed = errors.New("broker closed")
+
+// errPeerClosed is published to waiters when the broker's control stream ends
+// because the peer went away.
+var errPeerClosed = errors.New("broker stream closed by peer")
+
 type GRPCBroker struct {
 	nextId   uint32
 	streamer streamer
@@ -266,8 +272,27 @@ type GRPCBroker struct {
 	doneCh   chan struct{}
 	o        sync.Once
 
+	// clientStreams and serverStreams hold the entry that currently owns each
+	// stream ID. An ID stays in the map for the whole life of its entry,
+	// including the drain window, so a late frame from an old generation can
+	// never be routed to a new call reusing the ID.
 	clientStreams map[uint32]*gRPCBrokerPending
 	serverStreams map[uint32]*gRPCBrokerPending
+
+	// nextGeneration is bumped every time a new entry takes ownership of a
+	// stream ID. Together with the map identity checks it gives every
+	// generation unique ownership: frames are only delivered to the entry that
+	// owned the ID while they were negotiated.
+	nextGeneration uint64
+
+	// closed is set under the broker lock before doneCh is closed, so paths
+	// that reject new streams cannot race Close.
+	closed bool
+
+	// drainTimeout bounds how long a finished entry keeps its ID fenced off
+	// while late frames drain away. It is a field (rather than a constant) so
+	// tests can shorten it.
+	drainTimeout time.Duration
 
 	unixSocketCfg  UnixSocketConfig
 	addrTranslator runner.AddrTranslator
@@ -279,10 +304,64 @@ type GRPCBroker struct {
 	sync.Mutex
 }
 
+// entryState is the lifecycle phase of a gRPCBrokerPending entry.
+type entryState int
+
+const (
+	// entryLive means the entry owns its stream ID and is serving waiters.
+	entryLive entryState = iota
+	// entryDraining means the entry has published its terminal state exactly
+	// once; its ID is kept fenced off for drainTimeout while late frames from
+	// the old generation are absorbed and dropped.
+	entryDraining
+)
+
+// gRPCBrokerPending is the broker record for one generation of a stream ID.
+// Each Dial/knock/Accept gets an entry with a unique generation, and Run only
+// delivers frames to the entry whose generation owns the ID. Every terminal
+// path (normal completion, negotiation timeout, peer close, broker Close)
+// converges on finish, which publishes one result and then keeps the ID fenced
+// through its drain window before it can be recycled.
 type gRPCBrokerPending struct {
-	ch     chan *plugin.ConnInfo
+	// id and generation identify this exact ownership of a stream ID.
+	id         uint32
+	generation uint64
+
+	// ch carries frames from Run to the entry's waiters. It is buffered, so a
+	// frame arriving just as the entry finishes is absorbed and dropped by Run
+	// instead of blocking the broker receive loop.
+	ch chan *plugin.ConnInfo
+
+	// doneCh is closed once, by finish, when the terminal state is published.
 	doneCh chan struct{}
-	once   sync.Once
+
+	// recycledCh is closed once, after the drain window, when the entry has
+	// removed itself from the map and the ID is available for a new generation.
+	recycledCh chan struct{}
+
+	// terminal is the single result published to waiters. Set under the broker
+	// lock before doneCh is closed, so at most one terminal state exists.
+	terminal error
+
+	state entryState
+
+	// waiters counts in-flight knocks sharing this (client-side, multiplexed)
+	// entry. Such entries span many handshakes and are reaped only once idle,
+	// so a late ack can never be handed to the next generation.
+	waiters int
+
+	// reapSeq is bumped whenever a new handshake starts on a shared multiplexed
+	// entry. A scheduled reaper captures the current value; if it changed before
+	// the timer fires, a newer handshake owns the entry and the stale reaper
+	// must not delete it.
+	reapSeq uint64
+
+	// reapOnce guarantees the entry removes itself from its map and signals
+	// recycle exactly once, regardless of which lifecycle path gets there
+	// first (finish drain timer or an idle-reap timer).
+	reapOnce sync.Once
+
+	once sync.Once
 }
 
 func newGRPCBroker(s streamer, tls *tls.Config, unixSocketCfg UnixSocketConfig, addrTranslator runner.AddrTranslator, muxer grpcmux.GRPCMuxer) *GRPCBroker {
@@ -293,51 +372,257 @@ func newGRPCBroker(s streamer, tls *tls.Config, unixSocketCfg UnixSocketConfig, 
 
 		clientStreams: make(map[uint32]*gRPCBrokerPending),
 		serverStreams: make(map[uint32]*gRPCBrokerPending),
-		muxer:         muxer,
+
+		drainTimeout: defaultDrainTimeout,
+
+		muxer: muxer,
 
 		unixSocketCfg:  unixSocketCfg,
 		addrTranslator: addrTranslator,
 	}
 }
 
+// newPendingLocked mints an entry owned by a new, never-reused generation. The
+// caller must hold b.Lock.
+func (b *GRPCBroker) newPendingLocked(id uint32) *gRPCBrokerPending {
+	b.nextGeneration++
+	return &gRPCBrokerPending{
+		id:         id,
+		generation: b.nextGeneration,
+		ch:         make(chan *plugin.ConnInfo, 1),
+		doneCh:     make(chan struct{}),
+		recycledCh: make(chan struct{}),
+		state:      entryLive,
+	}
+}
+
+// acquireClientStream returns the live entry that currently owns stream id on
+// the client (dialing) side. If the previous generation is still draining, it
+// blocks on that entry's recycledCh until the ID is fenced back into the pool;
+// a fresh entry with a new generation is then created. It fails once the broker
+// has been closed.
+func (b *GRPCBroker) acquireClientStream(id uint32) (*gRPCBrokerPending, error) {
+	for {
+		b.Lock()
+		if b.closed {
+			b.Unlock()
+			return nil, errBrokerClosed
+		}
+
+		p, ok := b.clientStreams[id]
+		if !ok {
+			p = b.newPendingLocked(id)
+			b.clientStreams[id] = p
+			b.Unlock()
+			return p, nil
+		}
+
+		if p.state == entryLive {
+			b.Unlock()
+			return p, nil
+		}
+
+		// The previous generation is draining: its ID is not reusable until it
+		// has absorbed its late frames.
+		recycledCh := p.recycledCh
+		b.Unlock()
+		select {
+		case <-recycledCh:
+			// Loop and re-check under the lock; another acquirer may have won.
+		case <-b.doneCh:
+			return nil, errBrokerClosed
+		}
+	}
+}
+
+// acquireServerStream returns the live entry for a server-side (listening)
+// stream id, creating one with a fresh generation if none exists. Server
+// entries outlive individual knocks and are only recycled when the listener
+// closes. If the previous generation is still draining it waits for recycle
+// rather than handing a new listener an entry whose doneCh is already closed.
+// It fails once the broker has been closed.
+func (b *GRPCBroker) acquireServerStream(id uint32) (*gRPCBrokerPending, error) {
+	for {
+		b.Lock()
+		if b.closed {
+			b.Unlock()
+			return nil, errBrokerClosed
+		}
+
+		p, ok := b.serverStreams[id]
+		if !ok {
+			p = b.newPendingLocked(id)
+			b.serverStreams[id] = p
+			b.Unlock()
+			return p, nil
+		}
+
+		if p.state == entryLive {
+			b.Unlock()
+			return p, nil
+		}
+
+		// The listener for the previous generation is draining; wait for its
+		// ID to be recycled before minting a new generation.
+		recycledCh := p.recycledCh
+		b.Unlock()
+		select {
+		case <-recycledCh:
+		case <-b.doneCh:
+			return nil, errBrokerClosed
+		}
+	}
+}
+
+// addWaiter marks a new in-flight handshake on a shared multiplexed client
+// entry and returns the entry's new handshake sequence. The returned value
+// lets a previously scheduled reaper tell that a newer handshake now owns the
+// entry. removeWaiter decrements the count once the handshake completes.
+func (b *GRPCBroker) addWaiter(p *gRPCBrokerPending) uint64 {
+	b.Lock()
+	p.waiters++
+	p.reapSeq++
+	seq := p.reapSeq
+	b.Unlock()
+	return seq
+}
+
+func (b *GRPCBroker) removeWaiter(p *gRPCBrokerPending) {
+	b.Lock()
+	if p.waiters > 0 {
+		p.waiters--
+	}
+	b.Unlock()
+}
+
+// recycleLocked removes the entry from fromMap by identity and signals that
+// its stream ID is available for a new generation. Identity checking means a
+// newer generation that already holds the ID is never deleted by an older
+// entry's cleanup; reapOnce makes the recycle idempotent across the finish
+// drain timer and the idle-reap timer. The caller must hold b.Lock.
+func (b *GRPCBroker) recycleLocked(p *gRPCBrokerPending, fromMap map[uint32]*gRPCBrokerPending) {
+	p.reapOnce.Do(func() {
+		if cur := fromMap[p.id]; cur == p {
+			delete(fromMap, p.id)
+		}
+		close(p.recycledCh)
+	})
+}
+
+// finish converges every terminal path for a one-shot entry (a non-multiplexed
+// Dial, a multiplexed knock handshake, a server listener, peer shutdown, broker
+// Close). The terminal error is published to waiters exactly once; the entry
+// then drains for drainTimeout, absorbing late frames from its generation,
+// before recycling the ID.
+func (b *GRPCBroker) finish(p *gRPCBrokerPending, fromMap map[uint32]*gRPCBrokerPending, err error) {
+	p.once.Do(func() {
+		b.Lock()
+		if p.state != entryLive {
+			b.Unlock()
+			return
+		}
+		p.terminal = err
+		p.state = entryDraining
+		b.Unlock()
+
+		// Publish the single terminal state to all waiters.
+		close(p.doneCh)
+
+		// Keep the ID fenced off while late frames from this generation drain,
+		// then recycle it.
+		time.AfterFunc(b.drainTimeout, func() {
+			b.Lock()
+			b.recycleLocked(p, fromMap)
+			b.Unlock()
+		})
+	})
+}
+
+// scheduleIdleReap marks a multiplexed client entry for recycling once no
+// further handshake has started and the drain window has elapsed. seq is the
+// handshake sequence captured by the knock that scheduled the reap: if another
+// knock starts before the timer fires, its newer sequence invalidates this
+// reaper. This keeps the ID fenced through a drain window without letting a
+// stale timer delete an entry a new handshake is actively using.
+func (b *GRPCBroker) scheduleIdleReap(p *gRPCBrokerPending, seq uint64) {
+	time.AfterFunc(b.drainTimeout, func() {
+		b.Lock()
+		defer b.Unlock()
+
+		if p.state != entryLive || p.waiters > 0 || p.reapSeq != seq {
+			return
+		}
+		b.recycleLocked(p, b.clientStreams)
+	})
+}
+
+// waitForConnInfo waits for the peer to deliver a frame to a one-shot entry. It
+// returns the frame on normal completion, or the entry's terminal error on
+// timeout/close/peer shutdown, and guarantees the entry is finished exactly
+// once either way.
+func (b *GRPCBroker) waitForConnInfo(p *gRPCBrokerPending, fromMap map[uint32]*gRPCBrokerPending, timeoutErr error) (*plugin.ConnInfo, error) {
+	timer := time.NewTimer(negotiateTimeout)
+	defer timer.Stop()
+
+	select {
+	case msg := <-p.ch:
+		// This generation consumed the frame it was waiting for; finish and
+		// drain so any further frames for the ID cannot reach a new caller.
+		b.finish(p, fromMap, nil)
+		return msg, nil
+	case <-p.doneCh:
+		return nil, p.terminal
+	case <-timer.C:
+		b.finish(p, fromMap, timeoutErr)
+		return nil, timeoutErr
+	}
+}
+
+// muxEnabled reports whether broker multiplexing is in use. It is nil-interface
+// safe: brokers constructed without a muxer hold a nil GRPCMuxer.
+func (b *GRPCBroker) muxEnabled() bool {
+	return b.muxer != nil && b.muxer.Enabled()
+}
+
 // Accept accepts a connection by ID.
 //
 // This should not be called multiple times with the same ID at one time.
 func (b *GRPCBroker) Accept(id uint32) (net.Listener, error) {
-	if b.muxer.Enabled() {
-		p := b.getServerStream(id)
+	if b.muxEnabled() {
+		p, err := b.acquireServerStream(id)
+		if err != nil {
+			return nil, err
+		}
 		go func() {
-			err := b.listenForKnocks(id)
-			if err != nil {
+			if err := b.listenForKnocks(id); err != nil {
 				log.Printf("[ERR]: error listening for knocks, id: %d, error: %s", id, err)
 			}
 		}()
 
 		ln, err := b.muxer.Listener(id, p.doneCh)
 		if err != nil {
+			b.finish(p, b.serverStreams, err)
 			return nil, err
 		}
 
 		ln = &rmListener{
 			Listener: ln,
 			close: func() error {
-				// We could have multiple listeners on the same ID, so use sync.Once
-				// for closing doneCh to ensure we don't get a panic.
-				p.once.Do(func() {
-					close(p.doneCh)
-				})
-
-				b.Lock()
-				defer b.Unlock()
-
-				// No longer need to listen for knocks once the listener is closed.
-				delete(b.serverStreams, id)
-
+				// finish's sync.Once makes repeated closes (multiple listeners
+				// may wrap the same ID) safe and recycles the entry once.
+				b.finish(p, b.serverStreams, nil)
 				return nil
 			},
 		}
 
 		return ln, nil
+	}
+
+	b.Lock()
+	closed := b.closed
+	b.Unlock()
+	if closed {
+		return nil, errBrokerClosed
 	}
 
 	listener, err := serverListener(b.unixSocketCfg)
@@ -417,17 +702,72 @@ func (b *GRPCBroker) AcceptAndServe(id uint32, newGRPCServer func([]grpc.ServerO
 	_ = g.Run()
 }
 
-// Close closes the stream and all servers.
+// Close closes the stream and all servers. It is the single shutdown path:
+// once it runs, attempts to acquire new streams fail with errBrokerClosed, and
+// every in-flight waiter is published the same terminal error exactly once.
+// The lock is only held over map bookkeeping, never while waiting on a frame or
+// goroutine, so healthy streams cannot be blocked by the shutdown.
 func (b *GRPCBroker) Close() error {
 	b.streamer.Close()
+
 	b.o.Do(func() {
+		b.Lock()
+		b.closed = true
+		clientEntries := make([]*gRPCBrokerPending, 0, len(b.clientStreams))
+		for _, p := range b.clientStreams {
+			clientEntries = append(clientEntries, p)
+		}
+		serverEntries := make([]*gRPCBrokerPending, 0, len(b.serverStreams))
+		for _, p := range b.serverStreams {
+			serverEntries = append(serverEntries, p)
+		}
+		b.Unlock()
+
 		close(b.doneCh)
+
+		for _, p := range clientEntries {
+			b.finish(p, b.clientStreams, errBrokerClosed)
+		}
+		for _, p := range serverEntries {
+			b.finish(p, b.serverStreams, errBrokerClosed)
+		}
 	})
 	return nil
 }
 
+// shutdown is the peer-closed terminal path. Run invokes it when the control
+// stream returns an error. It converges with broker Close on finish, so callers
+// still observe exactly one terminal result; the error distinguishes a peer
+// shutdown from a local Close.
+func (b *GRPCBroker) shutdown(err error) {
+	b.Lock()
+	if b.closed {
+		b.Unlock()
+		return
+	}
+	clientEntries := make([]*gRPCBrokerPending, 0, len(b.clientStreams))
+	for _, p := range b.clientStreams {
+		clientEntries = append(clientEntries, p)
+	}
+	serverEntries := make([]*gRPCBrokerPending, 0, len(b.serverStreams))
+	for _, p := range b.serverStreams {
+		serverEntries = append(serverEntries, p)
+	}
+	b.Unlock()
+
+	for _, p := range clientEntries {
+		b.finish(p, b.clientStreams, err)
+	}
+	for _, p := range serverEntries {
+		b.finish(p, b.serverStreams, err)
+	}
+}
+
 func (b *GRPCBroker) listenForKnocks(id uint32) error {
-	p := b.getServerStream(id)
+	p, err := b.acquireServerStream(id)
+	if err != nil {
+		return err
+	}
 	for {
 		select {
 		case msg := <-p.ch:
@@ -461,40 +801,68 @@ func (b *GRPCBroker) listenForKnocks(id uint32) error {
 				return fmt.Errorf("error sending back knock acknowledgement: %w", err)
 			}
 		case <-p.doneCh:
+			return p.terminal
+		case <-b.doneCh:
 			return nil
 		}
 	}
 }
 
+// knock performs one multiplexing handshake for id. The entry that owns id is
+// shared across successive knocks (a listener answers many of them), so a knock
+// only registers itself as a waiter rather than finishing the entry; once the
+// handshake completes the entry is scheduled for idle reaping, which keeps the
+// ID fenced through the drain window before it may be reused.
 func (b *GRPCBroker) knock(id uint32) error {
+	p, err := b.acquireClientStream(id)
+	if err != nil {
+		return err
+	}
+	seq := b.addWaiter(p)
+	defer b.removeWaiter(p)
+
 	// Send a knock.
-	err := b.streamer.Send(&plugin.ConnInfo{
+	if err := b.streamer.Send(&plugin.ConnInfo{
 		ServiceId: id,
 		Knock: &plugin.ConnInfo_Knock{
 			Knock: true,
 		},
-	})
-	if err != nil {
+	}); err != nil {
+		b.finish(p, b.clientStreams, err)
 		return err
 	}
 
 	// Wait for the ack.
-	p := b.getClientStream(id)
+	timer := time.NewTimer(negotiateTimeout)
+	defer timer.Stop()
 	select {
 	case msg := <-p.ch:
 		if msg.ServiceId != id {
-			return fmt.Errorf("handshake failed for multiplexing on id %d; got response for %d", id, msg.ServiceId)
+			err := fmt.Errorf("handshake failed for multiplexing on id %d; got response for %d", id, msg.ServiceId)
+			b.finish(p, b.clientStreams, err)
+			return err
 		}
 		if msg.Knock == nil || !msg.Knock.Knock || !msg.Knock.Ack {
-			return fmt.Errorf("handshake failed for multiplexing on id %d; expected knock and ack, but got %+v", id, msg.Knock)
+			err := fmt.Errorf("handshake failed for multiplexing on id %d; expected knock and ack, but got %+v", id, msg.Knock)
+			b.finish(p, b.clientStreams, err)
+			return err
 		}
 		if msg.Knock.Error != "" {
-			return fmt.Errorf("failed to knock for id %d: %s", id, msg.Knock.Error)
+			err := fmt.Errorf("failed to knock for id %d: %s", id, msg.Knock.Error)
+			b.finish(p, b.clientStreams, err)
+			return err
 		}
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("timeout waiting for multiplexing knock handshake on id %d", id)
+	case <-p.doneCh:
+		return p.terminal
+	case <-timer.C:
+		err := fmt.Errorf("timeout waiting for multiplexing knock handshake on id %d", id)
+		b.finish(p, b.clientStreams, err)
+		return err
 	}
 
+	// Success: keep the entry alive briefly to absorb a duplicate/late ack,
+	// then reap it once no further handshake is using it.
+	b.scheduleIdleReap(p, seq)
 	return nil
 }
 
@@ -523,19 +891,20 @@ func (b *GRPCBroker) Dial(id uint32) (conn *grpc.ClientConn, err error) { return
 
 // Dial opens a connection by ID with options.
 func (b *GRPCBroker) DialWithOptions(id uint32, opts ...grpc.DialOption) (conn *grpc.ClientConn, err error) {
-	if b.muxer.Enabled() {
+	if b.muxEnabled() {
 		return dialGRPCConn(b.tls, b.muxDial(id), opts...)
 	}
 
-	var c *plugin.ConnInfo
+	// Acquire the unique generation that owns this ID for this call. If a
+	// previous generation is still draining, block until its ID is recycled.
+	p, err := b.acquireClientStream(id)
+	if err != nil {
+		return nil, err
+	}
 
-	// Open the stream
-	p := b.getClientStream(id)
-	select {
-	case c = <-p.ch:
-		close(p.doneCh)
-	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("timeout waiting for connection info")
+	c, err := b.waitForConnInfo(p, b.clientStreams, errors.New("timeout waiting for connection info"))
+	if err != nil {
+		return nil, err
 	}
 
 	network, address := c.Network, c.Address
@@ -576,78 +945,52 @@ func (m *GRPCBroker) NextId() uint32 {
 //
 // Uses of GRPCBroker never need to call this. It is called internally by
 // the plugin host/client.
-func (m *GRPCBroker) Run() {
+func (b *GRPCBroker) Run() {
 	for {
-		msg, err := m.streamer.Recv()
+		msg, err := b.streamer.Recv()
 		if err != nil {
-			// Once we receive an error, just exit
-			break
+			// The control stream is gone: converge every waiter on the same
+			// terminal state instead of leaving them to time out individually.
+			b.shutdown(errPeerClosed)
+			return
 		}
 
-		// Initialize the waiter
-		var p *gRPCBrokerPending
-		if msg.Knock != nil && msg.Knock.Knock && !msg.Knock.Ack {
-			p = m.getServerStream(msg.ServiceId)
-			// The server side doesn't close the channel immediately as it needs
-			// to continuously listen for knocks.
-		} else {
-			p = m.getClientStream(msg.ServiceId)
-			go m.timeoutWait(msg.ServiceId, p)
-		}
-		select {
-		case p.ch <- msg:
-		default:
-		}
+		b.route(msg)
 	}
 }
 
-// getClientStream is a buffer to receive new connection info and knock acks
-// by stream ID.
-func (m *GRPCBroker) getClientStream(id uint32) *gRPCBrokerPending {
-	m.Lock()
-	defer m.Unlock()
-
-	p, ok := m.clientStreams[id]
-	if ok {
-		return p
+// route delivers one control-stream frame to the entry that currently owns its
+// service ID. Frames for an ID with no live entry, or for an entry already in
+// its drain window, are late frames from an old generation and are dropped: they
+// must never create or reach a waiter belonging to a new call.
+func (b *GRPCBroker) route(msg *plugin.ConnInfo) {
+	b.Lock()
+	if b.closed {
+		b.Unlock()
+		return
 	}
 
-	m.clientStreams[id] = &gRPCBrokerPending{
-		ch:     make(chan *plugin.ConnInfo, 1),
-		doneCh: make(chan struct{}),
-	}
-	return m.clientStreams[id]
-}
-
-// getServerStream is a buffer to receive knocks to a multiplexed stream ID
-// that its side is listening on. Not used unless multiplexing is enabled.
-func (m *GRPCBroker) getServerStream(id uint32) *gRPCBrokerPending {
-	m.Lock()
-	defer m.Unlock()
-
-	p, ok := m.serverStreams[id]
-	if ok {
-		return p
+	var p *gRPCBrokerPending
+	if msg.Knock != nil && msg.Knock.Knock && !msg.Knock.Ack {
+		// An inbound knock is only valid for a live server listener. Knocks
+		// that arrive before Accept or after the listener closed are dropped
+		// rather than allocating an entry that could poison a later Accept.
+		p = b.serverStreams[msg.ServiceId]
+	} else {
+		p = b.clientStreams[msg.ServiceId]
 	}
 
-	m.serverStreams[id] = &gRPCBrokerPending{
-		ch:     make(chan *plugin.ConnInfo, 1),
-		doneCh: make(chan struct{}),
+	if p == nil || p.state != entryLive {
+		b.Unlock()
+		return
 	}
-	return m.serverStreams[id]
-}
+	b.Unlock()
 
-func (m *GRPCBroker) timeoutWait(id uint32, p *gRPCBrokerPending) {
-	// Wait for the stream to either be picked up and connected, or
-	// for a timeout.
+	// Buffered channel: if no waiter is ready (the handshake already timed
+	// out or completed), the frame is absorbed and dropped on the next read
+	// instead of stalling the receive loop.
 	select {
-	case <-p.doneCh:
-	case <-time.After(5 * time.Second):
+	case p.ch <- msg:
+	default:
 	}
-
-	m.Lock()
-	defer m.Unlock()
-
-	// Delete the stream so no one else can grab it
-	delete(m.clientStreams, id)
 }

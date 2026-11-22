@@ -112,6 +112,35 @@ func TestGRPC_Ping(t *testing.T) {
 	})
 }
 
+// TestGRPC_MuxBrokerRepeatedRoundTrip drives many broker-backed bidirectional
+// round trips over a real multiplexed (yamux) connection. Each round trip
+// allocates fresh broker stream IDs and performs knock/ack handshakes, so it
+// exercises generation ownership, drain fencing and ID recycling on the wire:
+// a late frame from one call must never be consumed by a later call.
+func TestGRPC_MuxBrokerRepeatedRoundTrip(t *testing.T) {
+	client, server := TestPluginGRPCConn(t, true, map[string]Plugin{
+		"test": new(testGRPCInterfacePlugin),
+	})
+	defer func() { _ = client.Close() }()
+	defer server.Stop()
+
+	raw, err := client.Dispense("test")
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	impl, ok := raw.(testInterface)
+	if !ok {
+		t.Fatalf("bad: %#v", raw)
+	}
+
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		if err := impl.Bidirectional(); err != nil {
+			t.Fatalf("round %d: %v", i, err)
+		}
+	}
+}
+
 func testGRPCClientPing(t *testing.T, multiplex bool) {
 	client, server := TestPluginGRPCConn(t, multiplex, map[string]Plugin{
 		"test": new(testGRPCInterfacePlugin),
