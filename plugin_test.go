@@ -37,6 +37,15 @@ var testVersionedHandshake = HandshakeConfig{
 	MagicCookieValue: "test",
 }
 
+// testCapabilityHandshake declares an explicit capability set including a
+// test-only capability, used to verify capability negotiation.
+var testCapabilityHandshake = HandshakeConfig{
+	ProtocolVersion:  1,
+	MagicCookieKey:   "TEST_MAGIC_COOKIE",
+	MagicCookieValue: "test",
+	Capabilities:     []string{"netrpc", "stdio-sync", "test-cap"},
+}
+
 // testInterface is the test interface we use for plugins.
 type testInterface interface {
 	Double(int) int
@@ -584,6 +593,14 @@ func TestHelperProcess(*testing.T) {
 	case "test-interface":
 		Serve(&ServeConfig{
 			HandshakeConfig: testHandshake,
+			Plugins:         testPluginMap,
+		})
+
+		// Shouldn't reach here but make sure we exit anyways
+		os.Exit(0)
+	case "test-interface-caps":
+		Serve(&ServeConfig{
+			HandshakeConfig: testCapabilityHandshake,
 			Plugins:         testPluginMap,
 		})
 

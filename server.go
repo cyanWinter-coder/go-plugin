@@ -52,6 +52,22 @@ type HandshakeConfig struct {
 	// we show human-friendly output.
 	MagicCookieKey   string
 	MagicCookieValue string
+
+	// Capabilities declares the optional protocol capabilities this side
+	// supports. Client and server exchange capability sets during the
+	// handshake and both sides operate on the intersection of the two sets.
+	// If nil, DefaultCapabilities() is assumed. Capabilities implied by
+	// other configuration (such as AutoMTLS or GRPCBrokerMultiplex on the
+	// client, or TLSProvider on the server) are always added automatically.
+	Capabilities []string
+
+	// RequiredCapabilities lists capabilities that must be present in the
+	// negotiated (intersected) capability set for the handshake to succeed.
+	// If the peer does not declare every required capability, negotiation
+	// fails before any RPC connection is made, rather than the plugin
+	// failing partway through startup. Required capabilities are never
+	// silently dropped, even when a lower protocol version is negotiated.
+	RequiredCapabilities []string
 }
 
 // PluginSet is a set of plugins provided to be registered in the plugin
@@ -221,6 +237,35 @@ func protocolVersion(opts *ServeConfig) (int, Protocol, PluginSet) {
 	return protoVersion, protoType, pluginSet
 }
 
+// serverCapabilities determines the capability set the server declares in
+// the handshake. Explicitly configured capabilities are used when present,
+// otherwise the default set is assumed. Capabilities implied by the rest of
+// the configuration are always added.
+func serverCapabilities(opts *ServeConfig) (CapabilitySet, error) {
+	var caps CapabilitySet
+	if opts.Capabilities != nil {
+		var err error
+		caps, err = capabilitiesFromStrings(opts.Capabilities)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		caps = DefaultCapabilities()
+	}
+
+	if opts.GRPCServer != nil {
+		caps.Add(CapabilityGRPC)
+	}
+	if opts.TLSProvider != nil {
+		caps.Add(CapabilityMTLS)
+	}
+	if multiplex, _ := strconv.ParseBool(os.Getenv(envMultiplexGRPC)); multiplex {
+		caps.Add(CapabilityGRPCBrokerMultiplex)
+	}
+
+	return caps, nil
+}
+
 // Serve serves the plugins given by ServeConfig.
 //
 // Serve doesn't return until the plugin is done being executed. Any
@@ -266,6 +311,18 @@ func Serve(opts *ServeConfig) {
 		}
 	}
 
+	// Parse the client's handshake request. A capability-aware client sends
+	// its capability set and instance identity along with the protocol
+	// versions; a request that carries only some of these fields is
+	// incompatible and rejected. A legacy client sends none of them and is
+	// served with the default capability set.
+	clientHS, err := parseClientHandshake(os.Getenv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid plugin handshake request: %s\n", err)
+		exitCode = 1
+		return
+	}
+
 	// negotiate the version and plugins
 	// start with default version in the handshake config
 	protoVersion, protoType, pluginSet := protocolVersion(opts)
@@ -278,6 +335,24 @@ func Serve(opts *ServeConfig) {
 			Output:     os.Stderr,
 			JSONFormat: true,
 		})
+	}
+
+	// Determine the capabilities this server declares for the handshake.
+	serverCaps, err := serverCapabilities(opts)
+	if err != nil {
+		logger.Error("plugin capability init", "error", err)
+		exitCode = 1
+		return
+	}
+
+	if clientHS.capable {
+		// Surface an unsatisfiable negotiation as early as possible. The
+		// client makes the final decision and terminates this process, but
+		// logging it here makes the failure visible on both sides.
+		if missing := clientHS.required.Difference(serverCaps); len(missing) > 0 {
+			logger.Error("client requires capabilities this plugin does not support",
+				"missing", missing.String())
+		}
 	}
 
 	// Register a listener so we can accept a connection
@@ -441,6 +516,18 @@ func Serve(opts *ServeConfig) {
 		// strings.Split(line, "|") and always handle each segment individually.
 		if os.Getenv(envMultiplexGRPC) != "" {
 			protocolLine += fmt.Sprintf("|%v", grpcBrokerMultiplexingSupported)
+		}
+
+		if clientHS.capable {
+			// A capability-aware client gets the full handshake response:
+			// multiplexing support (padded if the legacy segment above was
+			// not emitted), the server's declared capability set, and the
+			// server's instance identity. All three are mandatory so the
+			// client can treat a partial response as incompatible.
+			if os.Getenv(envMultiplexGRPC) == "" {
+				protocolLine += "|false"
+			}
+			protocolLine += fmt.Sprintf("|%s|%s", serverCaps.String(), newInstanceID())
 		}
 		fmt.Printf("%s\n", protocolLine)
 		_ = os.Stdout.Sync()

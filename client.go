@@ -99,6 +99,22 @@ type Client struct {
 	ctxCancel         context.CancelFunc
 	negotiatedVersion int
 
+	// startErr records the terminal failure of Start. Once set, Start
+	// returns this error instead of re-attempting the handshake, so a late
+	// handshake response can never resurrect a failed instance.
+	startErr error
+
+	// instanceID is this client's handshake instance identity.
+	instanceID string
+
+	// peerInstanceID is the instance identity the server sent back in its
+	// handshake response. Empty for legacy servers.
+	peerInstanceID string
+
+	// negotiatedCapabilities is the minimal common capability set agreed
+	// with the server during the handshake.
+	negotiatedCapabilities CapabilitySet
+
 	// clientWaitGroup is used to manage the lifecycle of the plugin management
 	// goroutines.
 	clientWaitGroup sync.WaitGroup
@@ -121,6 +137,36 @@ type Client struct {
 // This is only valid after Start() is called.
 func (c *Client) NegotiatedVersion() int {
 	return c.negotiatedVersion
+}
+
+// NegotiatedCapabilities returns the sorted capability set negotiated with
+// the server during the handshake: the minimal common set of both sides'
+// declared capabilities. For legacy servers that do not exchange capability
+// fields, this is DefaultCapabilities(). This is only valid after Start()
+// is called.
+func (c *Client) NegotiatedCapabilities() []string {
+	c.l.Lock()
+	defer c.l.Unlock()
+
+	if c.negotiatedCapabilities == nil {
+		return nil
+	}
+
+	sorted := c.negotiatedCapabilities.Sorted()
+	out := make([]string, len(sorted))
+	for i, cap := range sorted {
+		out[i] = string(cap)
+	}
+	return out
+}
+
+// PeerInstanceID returns the instance identity the plugin sent in its
+// handshake response. It is empty for legacy plugins that do not exchange
+// capability fields. This is only valid after Start() is called.
+func (c *Client) PeerInstanceID() string {
+	c.l.Lock()
+	defer c.l.Unlock()
+	return c.peerInstanceID
 }
 
 // ID returns a unique ID for the running plugin. By default this is the process
@@ -291,6 +337,48 @@ type UnixSocketConfig struct {
 	// by go-plugin and deleted when the plugin is killed. Will be created
 	// inside TempDir if specified.
 	socketDir string
+}
+
+// capabilitySet determines the capability set the client declares in the
+// handshake. Explicitly configured capabilities are used when present,
+// otherwise the default set is assumed. Capabilities implied by the rest of
+// the configuration are always added.
+func (c *ClientConfig) capabilitySet() (CapabilitySet, error) {
+	var caps CapabilitySet
+	if c.Capabilities != nil {
+		var err error
+		caps, err = capabilitiesFromStrings(c.Capabilities)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		caps = DefaultCapabilities()
+	}
+
+	if c.AutoMTLS {
+		caps.Add(CapabilityMTLS)
+	}
+	if c.GRPCBrokerMultiplex {
+		caps.Add(CapabilityGRPCBrokerMultiplex)
+	}
+
+	return caps, nil
+}
+
+// requiredCapabilitySet determines the capabilities the client requires the
+// server to support for the handshake to succeed. AutoMTLS cannot be
+// silently downgraded, so it always implies a required mTLS capability.
+func (c *ClientConfig) requiredCapabilitySet() (CapabilitySet, error) {
+	required, err := capabilitiesFromStrings(c.RequiredCapabilities)
+	if err != nil {
+		return nil, err
+	}
+
+	if c.AutoMTLS {
+		required.Add(CapabilityMTLS)
+	}
+
+	return required, nil
 }
 
 // ReattachConfig is used to configure a client to reattach to an
@@ -585,6 +673,13 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		return c.address, nil
 	}
 
+	// A previous Start already reached a terminal failure. Return the same
+	// error rather than re-attempting the handshake: a late response from
+	// the failed instance must not resurrect it.
+	if c.startErr != nil {
+		return nil, c.startErr
+	}
+
 	// If one of cmd or reattach isn't set, then it is an error. We wrap
 	// this in a {} for scoping reasons, and hopeful that the escape
 	// analysis will pop the stack here.
@@ -635,11 +730,30 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		versionStrings = append(versionStrings, strconv.Itoa(v))
 	}
 
+	// Determine the capabilities this client declares and requires. The
+	// handshake request carries the version list, the capability sets, and
+	// this client's instance identity; a capability-aware server answers
+	// with the same three kinds of information.
+	clientCaps, err := c.config.capabilitySet()
+	if err != nil {
+		return nil, fmt.Errorf("invalid client capabilities: %w", err)
+	}
+	requiredCaps, err := c.config.requiredCapabilitySet()
+	if err != nil {
+		return nil, fmt.Errorf("invalid client required capabilities: %w", err)
+	}
+	c.instanceID = newInstanceID()
+
 	env := []string{
 		fmt.Sprintf("%s=%s", c.config.MagicCookieKey, c.config.MagicCookieValue),
 		fmt.Sprintf("PLUGIN_MIN_PORT=%d", c.config.MinPort),
 		fmt.Sprintf("PLUGIN_MAX_PORT=%d", c.config.MaxPort),
 		fmt.Sprintf("PLUGIN_PROTOCOL_VERSIONS=%s", strings.Join(versionStrings, ",")),
+		fmt.Sprintf("%s=%s", envClientCapabilities, clientCaps.String()),
+		fmt.Sprintf("%s=%s", envClientInstanceID, c.instanceID),
+	}
+	if len(requiredCaps) > 0 {
+		env = append(env, fmt.Sprintf("%s=%s", envClientRequiredCapabilities, requiredCaps.String()))
 	}
 	if c.config.GRPCBrokerMultiplex {
 		env = append(env, fmt.Sprintf("%s=true", envMultiplexGRPC))
@@ -742,7 +856,16 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		rErr := recover()
 
 		if err != nil || rErr != nil {
+			// Terminate the subprocess. This also tears down the stdio
+			// pipes, and since no RPC client or broker is ever created for
+			// a failed handshake, nothing outlives the negotiation.
 			_ = runner.Kill(context.Background())
+		}
+
+		if err != nil {
+			// Record the terminal state so a late handshake response or a
+			// subsequent Start call cannot resurrect this instance.
+			c.startErr = err
 		}
 
 		if rErr != nil {
@@ -941,6 +1064,29 @@ func (c *Client) Start() (addr net.Addr, err error) {
 				return nil, ErrGRPCBrokerMuxNotSupported
 			}
 		}
+
+		// Negotiate capabilities with the server. A capability-aware server
+		// declares its capability set and instance identity in the response;
+		// a legacy server without these fields is assumed to support the
+		// default capability set. A partial capability response is
+		// incompatible and fails the handshake here, before any RPC
+		// connection is made.
+		var serverHS *serverHandshake
+		serverHS, err = parseServerHandshake(parts)
+		if err != nil {
+			return nil, err
+		}
+
+		var negotiated CapabilitySet
+		negotiated, err = negotiateCapabilities(clientCaps, serverHS.capabilities, requiredCaps)
+		if err != nil {
+			return nil, err
+		}
+
+		c.negotiatedCapabilities = negotiated
+		c.peerInstanceID = serverHS.instanceID
+		c.logger.Debug("negotiated capabilities", "capabilities", negotiated.String(),
+			"server_instance", serverHS.instanceID)
 	}
 
 	c.address = addr
@@ -1011,6 +1157,9 @@ func (c *Client) reattach() (net.Addr, error) {
 		// Default the protocol to net/rpc for backwards compatibility
 		c.protocol = ProtocolNetRPC
 	}
+
+	// Reattaching skips the handshake, so assume the default capability set.
+	c.negotiatedCapabilities = DefaultCapabilities()
 
 	if c.config.Reattach.Test {
 		c.negotiatedVersion = c.config.Reattach.ProtocolVersion
