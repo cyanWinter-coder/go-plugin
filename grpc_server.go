@@ -85,7 +85,7 @@ func (s *GRPCServer) Init() error {
 	reflection.Register(s.server)
 
 	// Register the broker service
-	brokerServer := newGRPCBrokerServer()
+	brokerServer := newGRPCBrokerServer(DefaultGRPCBrokerQueueCapacity)
 	plugin.RegisterGRPCBrokerServer(s.server, brokerServer)
 	s.broker = newGRPCBroker(brokerServer, s.TLS, unixSocketConfigFromEnv(), nil, s.muxer)
 	go s.broker.Run()

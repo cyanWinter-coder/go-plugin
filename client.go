@@ -267,6 +267,15 @@ type ClientConfig struct {
 	// before calling AcceptAndServe again.
 	GRPCBrokerMultiplex bool
 
+	// GRPCBrokerQueueCapacity sets the capacity of the gRPC broker's bounded
+	// per-connection forwarding queues (one send queue and one receive queue
+	// per broker connection). When a queue is full the broker fails the
+	// operation with an error wrapping ErrBrokerQueueFull instead of blocking
+	// or silently dropping messages.
+	//
+	// If zero or negative, DefaultGRPCBrokerQueueCapacity is used.
+	GRPCBrokerQueueCapacity int
+
 	// SkipHostEnv allows plugins to run without inheriting the parent process'
 	// environment variables.
 	SkipHostEnv bool

@@ -5,6 +5,7 @@ SECURITY:
 
 ENHANCEMENTS:
 * deps: Removed direct use of deprecated `github.com/golang/protobuf` in favour of `google.golang.org/protobuf` [[GH-388](https://github.com/hashicorp/go-plugin/pull/388)]
+* grpc/broker: Added deterministic stream-session and capacity boundaries to the gRPC broker's bidirectional control stream. Broker connections, bidirectional streams and local service calls now carry distinct session identities that are checked before a message is forwarded, so late messages from a stream replaced by a reconnect can never be committed onto the replacement stream. Closing a session fails each in-flight service call on that stream once (`ErrBrokerSessionClosed`) and discards late remote messages. The per-connection forwarding queues are bounded (`ClientConfig.GRPCBrokerQueueCapacity`, default 64) and a saturated queue returns a recognisable `ErrBrokerQueueFull` instead of blocking. Duplicate/concurrent stream attachments keep a single current stream and an old stream can no longer close the newer one. The gRPC client/server service and streaming interfaces are unchanged.
 
 ## v1.7.0
 
