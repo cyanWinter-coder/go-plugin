@@ -114,6 +114,14 @@ func (c *CmdRunner) ID() string {
 	return fmt.Sprintf("%d", c.pid)
 }
 
+// Alive reports whether the plugin process is still running. It lets a client
+// refuse to reconnect to an instance that has already exited. A process that
+// has exited but has not been reaped yet may still report as alive; the
+// client's own exit watcher and the reconnect dial cover that case.
+func (c *CmdRunner) Alive() bool {
+	return c.pid != 0 && pidAlive(c.pid)
+}
+
 // peTypes is a list of Portable Executable (PE) machine types from https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
 // mapped to GOARCH types. It is not comprehensive, and only includes machine types that Go supports.
 var peTypes = map[uint16]string{

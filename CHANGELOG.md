@@ -4,6 +4,18 @@ SECURITY:
 * deps: Updated google.golang.org/grpc to v1.81.1 [[GH-383](https://github.com/hashicorp/go-plugin/pull/383)]
 
 ENHANCEMENTS:
+* Added `Client.Reconnect`, which safely re-establishes the control connection
+  to the plugin instance a client is already bound to, without starting a
+  second process. The process identity, handshake endpoint and negotiated
+  protocol version are published together as an immutable `InstanceView`
+  (`Client.InstanceView`), reconnection verifies the discovery record, process
+  identity and endpoint before dialing, publishes the new connection
+  atomically with a generation guard so a concurrent or late attempt cannot
+  supersede it, releases the connection and records a typed
+  `*ReconnectError` on cancel, timeout, process exit or handshake failure, and
+  retains the last failure through `Client.LastReconnectError`. `Start`,
+  `Client`, `Kill`, `ReattachConfig` and `Discover` keep their existing
+  single-connection behavior.
 * deps: Removed direct use of deprecated `github.com/golang/protobuf` in favour of `google.golang.org/protobuf` [[GH-388](https://github.com/hashicorp/go-plugin/pull/388)]
 
 ## v1.7.0

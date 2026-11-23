@@ -60,3 +60,9 @@ func (c *CmdAttachedRunner) Kill(_ context.Context) error {
 func (c *CmdAttachedRunner) ID() string {
 	return fmt.Sprintf("%d", c.pid)
 }
+
+// Alive reports whether the reattached process is still running, so that a
+// client can refuse to reconnect to an instance that has already exited.
+func (c *CmdAttachedRunner) Alive() bool {
+	return c.pid != 0 && pidAlive(c.pid)
+}

@@ -18,6 +18,11 @@ import (
 )
 
 func dialGRPCConn(tls *tls.Config, dialer func(context.Context, string) (net.Conn, error), dialOpts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	return dialGRPCConnContext(context.Background(), tls, dialer, dialOpts...)
+}
+
+// dialGRPCConnContext is dialGRPCConn with a context bounding the dial.
+func dialGRPCConnContext(ctx context.Context, tls *tls.Config, dialer func(context.Context, string) (net.Conn, error), dialOpts ...grpc.DialOption) (*grpc.ClientConn, error) {
 	// Build dialing options.
 	opts := make([]grpc.DialOption, 0)
 
@@ -45,7 +50,7 @@ func dialGRPCConn(tls *tls.Config, dialer func(context.Context, string) (net.Con
 
 	// Connect. Note the first parameter is unused because we use a custom
 	// dialer that has the state to see the address.
-	conn, err := grpc.Dial("unused", opts...) //nolint:staticcheck
+	conn, err := grpc.DialContext(ctx, "unused", opts...) //nolint:staticcheck
 	if err != nil {
 		return nil, err
 	}
@@ -56,13 +61,20 @@ func dialGRPCConn(tls *tls.Config, dialer func(context.Context, string) (net.Con
 // newGRPCClient creates a new GRPCClient. The Client argument is expected
 // to be successfully started already with a lock held.
 func newGRPCClient(doneCtx context.Context, c *Client) (*GRPCClient, error) {
-	conn, err := dialGRPCConn(c.config.TLSConfig, c.dialer, c.config.GRPCDialOptions...)
+	return newGRPCClientContext(context.Background(), doneCtx, c)
+}
+
+// newGRPCClientContext creates a new GRPCClient, bounding dialing and the
+// initial stdio setup by ctx.
+func newGRPCClientContext(ctx context.Context, doneCtx context.Context, c *Client) (*GRPCClient, error) {
+	conn, err := dialGRPCConnContext(ctx, c.config.TLSConfig, c.dialer, c.config.GRPCDialOptions...)
 	if err != nil {
 		return nil, err
 	}
 
 	muxer, err := c.getGRPCMuxer(c.address)
 	if err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 
@@ -72,9 +84,17 @@ func newGRPCClient(doneCtx context.Context, c *Client) (*GRPCClient, error) {
 	go broker.Run()
 	go func() { _ = brokerGRPCClient.StartStream() }()
 
-	// Start the stdio client
-	stdioClient, err := newGRPCStdioClient(doneCtx, c.logger.Named("stdio"), conn)
+	// Start the stdio client. Its stream must live for the lifetime of the
+	// connection, not just the reconnect deadline, so it is created with the
+	// client's done context.
+	stdioCtx := doneCtx
+	if stdioCtx == nil {
+		stdioCtx = ctx
+	}
+	stdioClient, err := newGRPCStdioClient(stdioCtx, c.logger.Named("stdio"), conn)
 	if err != nil {
+		_ = broker.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	go stdioClient.Run(c.config.SyncStdout, c.config.SyncStderr)
@@ -108,6 +128,14 @@ func (c *GRPCClient) Close() error {
 	return c.Conn.Close()
 }
 
+// ReleaseConnection releases the transport without asking the plugin process
+// to shut down, so that a connection being rolled back can't stop an instance
+// that is still current.
+func (c *GRPCClient) ReleaseConnection() error {
+	_ = c.broker.Close()
+	return c.Conn.Close()
+}
+
 // ClientProtocol impl.
 func (c *GRPCClient) Dispense(name string) (interface{}, error) {
 	raw, ok := c.Plugins[name]
@@ -125,8 +153,14 @@ func (c *GRPCClient) Dispense(name string) (interface{}, error) {
 
 // ClientProtocol impl.
 func (c *GRPCClient) Ping() error {
+	return c.pingContext(context.Background())
+}
+
+// pingContext is Ping bounded by ctx, used by reconnect so that a hung health
+// check can't outlive the attempt's deadline.
+func (c *GRPCClient) pingContext(ctx context.Context) error {
 	client := grpc_health_v1.NewHealthClient(c.Conn)
-	_, err := client.Check(context.Background(), &grpc_health_v1.HealthCheckRequest{
+	_, err := client.Check(ctx, &grpc_health_v1.HealthCheckRequest{
 		Service: GRPCServiceName,
 	})
 

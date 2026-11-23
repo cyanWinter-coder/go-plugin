@@ -115,6 +115,31 @@ type Client struct {
 
 	grpcMuxerOnce sync.Once
 	grpcMuxer     *grpcmux.GRPCClientMuxer
+
+	// instance is the published, immutable view of the plugin instance this
+	// client is bound to: its process identity, handshake endpoint and
+	// negotiated protocol version. It is nil until Start (or reattach)
+	// succeeds, and is protected by c.l.
+	instance *InstanceView
+
+	// startErr is the terminal error of the first failed Start. Once set,
+	// Start and Client return it instead of reusing a torn-down process, so a
+	// late handshake response can never resurrect a failed instance. It is
+	// protected by c.l.
+	startErr error
+
+	// lastReconnectErr records the error of the most recent Reconnect call.
+	// It is protected by c.l.
+	lastReconnectErr error
+
+	// closing is set as soon as Kill begins, so that a concurrent reconnect
+	// can never publish a connection to a process that is being torn down.
+	// It is protected by c.l.
+	closing bool
+
+	// dialInstance overrides how Reconnect establishes a candidate control
+	// connection. It is only used by tests and is set before Start.
+	dialInstance func(context.Context, InstanceView) (ClientProtocol, error)
 }
 
 // NegotiatedVersion returns the protocol version negotiated with the server.
@@ -192,6 +217,11 @@ type ClientConfig struct {
 	// StartTimeout is the timeout to wait for the plugin to say it
 	// has started successfully.
 	StartTimeout time.Duration
+
+	// ReconnectTimeout bounds a single Client.Reconnect attempt, including
+	// dialing the plugin and its health check. If it is zero, StartTimeout is
+	// used.
+	ReconnectTimeout time.Duration
 
 	// If non-nil, then the stderr of the client will be written to here
 	// (as well as the log). This is the original os.Stderr of the subprocess.
@@ -443,8 +473,7 @@ func NewClient(config *ClientConfig) (c *Client) {
 //
 // Subsequent calls to this will return the same client.
 func (c *Client) Client() (ClientProtocol, error) {
-	_, err := c.Start()
-	if err != nil {
+	if _, err := c.Start(); err != nil {
 		return nil, err
 	}
 
@@ -455,6 +484,13 @@ func (c *Client) Client() (ClientProtocol, error) {
 		return c.client, nil
 	}
 
+	if c.startErr != nil {
+		// The instance was torn down; don't create a connection against a
+		// process that is no longer running.
+		return nil, c.startErr
+	}
+
+	var err error
 	switch c.protocol {
 	case ProtocolNetRPC:
 		c.client, err = newRPCClient(c)
@@ -470,6 +506,12 @@ func (c *Client) Client() (ClientProtocol, error) {
 		c.client = nil
 		return nil, err
 	}
+
+	// A control connection is now published for the instance captured at
+	// startup. Advance its generation so a reconnect that raced this
+	// publication cannot silently replace it with a connection dialed
+	// against older evidence.
+	c.publishConnectedLocked()
 
 	return c.client, nil
 }
@@ -503,10 +545,18 @@ func (c *Client) Kill() {
 	hostSocketDir := c.unixSocketCfg.socketDir
 	c.l.Unlock()
 
-	// If there is no runner or ID, there is nothing to kill.
+	// If there is no runner or ID, there is nothing to kill. This includes
+	// test-mode reattach clients, whose process is left running and remains
+	// reconnectable.
 	if runner == nil || runner.ID() == "" {
 		return
 	}
+
+	// From here on the instance is being torn down: no reconnect may publish
+	// a new connection to it.
+	c.l.Lock()
+	c.closing = true
+	c.l.Unlock()
 
 	defer func() {
 		// Wait for the all client goroutines to finish.
@@ -517,9 +567,11 @@ func (c *Client) Kill() {
 		}
 
 		// Make sure there is no reference to the old process after it has been
-		// killed.
+		// killed. The instance view is marked exited so that a reconnect can
+		// never target the process after it has been torn down.
 		c.l.Lock()
 		c.runner = nil
+		c.markExitedLocked()
 		c.l.Unlock()
 	}()
 
@@ -584,6 +636,22 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	if c.address != nil {
 		return c.address, nil
 	}
+
+	if c.startErr != nil {
+		// A previous Start failed and already tore down the plugin. Starting
+		// again would reuse an instance that no longer exists.
+		return nil, c.startErr
+	}
+
+	// Every error path below must record a terminal failure, so that a late
+	// handshake response or a later Start call cannot resurrect this
+	// instance. A failed reattach starts no process and holds no resources,
+	// so it stays retryable for compatibility.
+	defer func() {
+		if err != nil && c.startErr == nil && c.config.Reattach == nil {
+			c.startErr = err
+		}
+	}()
 
 	// If one of cmd or reattach isn't set, then it is an error. We wrap
 	// this in a {} for scoping reasons, and hopeful that the escape
@@ -787,7 +855,7 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		// Set that we exited, which takes a lock
 		c.l.Lock()
 		defer c.l.Unlock()
-		c.exited = true
+		c.markExitedLocked()
 	}()
 
 	// Start a goroutine that is going to be reading the lines
@@ -944,6 +1012,12 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	}
 
 	c.address = addr
+
+	// Publish the process identity, handshake endpoint and negotiated
+	// protocol version together as one immutable instance view. Nothing else
+	// in Start mutates them afterwards, so a reconnect can only ever target
+	// this exact instance.
+	c.publishInstanceLocked(c.runner.ID())
 	return
 }
 
@@ -1001,7 +1075,7 @@ func (c *Client) reattach() (net.Addr, error) {
 		// Mark it
 		c.l.Lock()
 		defer c.l.Unlock()
-		c.exited = true
+		c.markExitedLocked()
 	}(r)
 
 	// Set the address and protocol
@@ -1021,6 +1095,16 @@ func (c *Client) reattach() (net.Addr, error) {
 		// exiting on its own.
 		c.runner = r
 	}
+
+	// Publish the identity of the instance we attached to so that a later
+	// Reconnect can verify it is still talking to the same process.
+	instanceID := ""
+	if !c.config.Reattach.Test {
+		instanceID = r.ID()
+	} else {
+		instanceID = strconv.Itoa(c.config.Reattach.Pid)
+	}
+	c.publishInstanceLocked(instanceID)
 
 	return c.address, nil
 }

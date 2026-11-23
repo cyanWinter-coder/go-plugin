@@ -71,6 +71,14 @@ This requires the host/plugin to know this is possible and daemonize
 properly. `NewClient` takes a `ReattachConfig` to determine if and how to
 reattach.
 
+**Safe reconnection.** If the control connection to a running plugin is lost,
+`Client.Reconnect` re-establishes it against the same process instead of
+launching a second instance. It verifies the recorded process identity and
+handshake endpoint first, publishes the new connection atomically, and reports
+a typed failure (canceled, timed out, process exited, handshake failed,
+identity mismatch) while leaving the previous connection intact. See the
+[internals documentation](docs/internals.md#reconnecting-to-a-running-instance).
+
 **Cryptographically Secure Plugins.** Plugins can be verified with an expected
 checksum and RPC communications can be configured to use TLS. The host process
 must be properly secured to protect this configuration.

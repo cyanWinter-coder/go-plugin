@@ -62,6 +62,48 @@ Where:
     also be "grpc". This is the protocol that the plugin wants to speak to
     the host process with.
 
+## Reconnecting to a Running Instance
+
+A plugin process outlives the control connection when the host loses it (for
+example, after a host restart or a dropped socket). `Client.Reconnect`
+re-establishes the control connection to the *same* plugin process; it never
+launches a new one.
+
+The client publishes an immutable `InstanceView` as soon as the handshake
+completes. The view binds together the process identity (the runner ID, or the
+PID), the handshake endpoint, the negotiated protocol and the protocol
+version. Its `ConnectionGeneration` advances each time a control connection is
+published.
+
+`Reconnect` is an all-or-nothing transition:
+
+  1. It verifies the bound evidence. When `ClientConfig.Reattach` is set, the
+     record's address, PID, protocol and protocol version must still match the
+     view; the runner's identity must match too, and it must report alive when
+     it can. A record that reuses a PID or port but describes a different
+     process is refused with `ErrInstanceIdentityMismatch`.
+  2. It dials the recorded endpoint and pings the new connection. Nothing is
+     published yet, so a failed attempt leaves the previous connection
+     untouched.
+  3. It publishes the new connection against the generation it started from.
+     If another reconnect published first, this attempt has lost: its own
+     connection is released and the winner is returned. Releasing a connection
+     uses `ConnectionReleaser.ReleaseConnection` where available, so rolling
+     back never asks the plugin process to shut down.
+
+A canceled `Reconnect` returns `ErrReconnectCanceled`, a timed-out one
+`ErrReconnectTimeout`, an exited process `ErrReconnectProcessExited`, and an
+unreachable or unhealthy endpoint `ErrReconnectHandshake`. Each is wrapped in a
+`*ReconnectError` that records the reason, and the last failure is available
+from `Client.LastReconnectError`.
+
+Connections that are superseded are released with a generation guard, so a
+late close from an old connection can never clear the currently published one.
+
+Reconnection is not supported with gRPC broker multiplexing, because the
+multiplexed broker session is tied to the original connection. The attempt is
+refused rather than publishing a connection that cannot carry broker traffic.
+
 ## Environment Variables
 
 When serving a plugin over TCP, the following environment variables can be

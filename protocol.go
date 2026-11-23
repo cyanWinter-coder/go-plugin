@@ -46,3 +46,15 @@ type ClientProtocol interface {
 	// Ping checks that the client connection is still healthy.
 	Ping() error
 }
+
+// ConnectionReleaser is an optional interface a ClientProtocol may implement
+// to release a connection without asking the plugin process to shut down.
+//
+// Close is the graceful shutdown used by Client.Kill: for the built-in
+// protocols it asks the plugin to quit. A connection that is being rolled back
+// from a failed or superseded reconnect must not do that, because the plugin
+// process is still the current instance. Implementations that do not provide
+// this interface fall back to Close.
+type ConnectionReleaser interface {
+	ReleaseConnection() error
+}

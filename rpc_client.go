@@ -4,6 +4,7 @@
 package plugin
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -26,8 +27,14 @@ type RPCClient struct {
 // newRPCClient creates a new RPCClient. The Client argument is expected
 // to be successfully started already with a lock held.
 func newRPCClient(c *Client) (*RPCClient, error) {
+	return newRPCClientContext(context.Background(), c)
+}
+
+// newRPCClientContext creates a new RPCClient, honoring ctx while dialing.
+func newRPCClientContext(ctx context.Context, c *Client) (*RPCClient, error) {
 	// Connect to the client
-	conn, err := net.Dial(c.address.Network(), c.address.String())
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, c.address.Network(), c.address.String())
 	if err != nil {
 		return nil, err
 	}
@@ -122,23 +129,41 @@ func (c *RPCClient) Close() error {
 	var empty struct{}
 	returnErr := c.control.Call("Control.Quit", true, &empty)
 
-	// Close the other streams we have
-	if err := c.control.Close(); err != nil {
-		return err
-	}
-	if err := c.stdout.Close(); err != nil {
-		return err
-	}
-	if err := c.stderr.Close(); err != nil {
-		return err
-	}
-	if err := c.broker.Close(); err != nil {
+	if err := c.releaseStreams(); err != nil {
 		return err
 	}
 
 	// Return back the error we got from Control.Quit. This is very important
 	// since we MUST return non-nil error if this fails so that Client.Kill
 	// will properly try a process.Kill.
+	return returnErr
+}
+
+// ReleaseConnection closes the transport without asking the plugin process to
+// quit, so that a connection being rolled back can't shut down an instance
+// that is still current.
+func (c *RPCClient) ReleaseConnection() error {
+	return c.releaseStreams()
+}
+
+// releaseStreams closes the control and multiplexed stdio streams.
+func (c *RPCClient) releaseStreams() error {
+	var returnErr error
+
+	// Close the other streams we have
+	if err := c.control.Close(); err != nil && returnErr == nil {
+		returnErr = err
+	}
+	if err := c.stdout.Close(); err != nil && returnErr == nil {
+		returnErr = err
+	}
+	if err := c.stderr.Close(); err != nil && returnErr == nil {
+		returnErr = err
+	}
+	if err := c.broker.Close(); err != nil && returnErr == nil {
+		returnErr = err
+	}
+
 	return returnErr
 }
 
@@ -170,4 +195,22 @@ func (c *RPCClient) Dispense(name string) (interface{}, error) {
 func (c *RPCClient) Ping() error {
 	var empty struct{}
 	return c.control.Call("Control.Ping", true, &empty)
+}
+
+// pingContext is Ping bounded by ctx. net/rpc calls cannot be canceled, so the
+// call runs in the background and the result is discarded if ctx expires; the
+// caller releases the connection on failure, which unblocks the call.
+func (c *RPCClient) pingContext(ctx context.Context) error {
+	done := make(chan error, 1)
+	go func() {
+		var empty struct{}
+		done <- c.control.Call("Control.Ping", true, &empty)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
