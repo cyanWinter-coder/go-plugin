@@ -516,6 +516,28 @@ func TestHelperProcess(*testing.T) {
 	case "start-timeout":
 		time.Sleep(1 * time.Minute)
 		os.Exit(1)
+	case "crash-exit-code":
+		// Emit the handshake first so the client reaches ready state, then exit
+		// with a non-zero status and a recognizable stderr message.
+		fmt.Printf("%d|%d|tcp|:1234\n", CoreProtocolVersion, testHandshake.ProtocolVersion)
+		_, _ = os.Stderr.WriteString("boom: deliberate failure for testing\n")
+		os.Exit(23)
+	case "crash-signal":
+		fmt.Printf("%d|%d|tcp|:1234\n", CoreProtocolVersion, testHandshake.ProtocolVersion)
+		_, _ = os.Stderr.WriteString("going down by signal\n")
+		terminateSelfBySignal()
+		// If the platform helper does not terminate the process, fail loudly.
+		os.Exit(1)
+	case "crash-before-handshake":
+		// Never emit the handshake: fail immediately with output on stderr.
+		_, _ = os.Stderr.WriteString("startup failure detail line\n")
+		os.Exit(42)
+	case "ignore-sigterm":
+		// Handshake normally, then ignore termination requests so the host's
+		// graceful shutdown times out and it has to force-kill the process.
+		ignoreTerminationSignals()
+		fmt.Printf("%d|%d|tcp|:1234\n", CoreProtocolVersion, testHandshake.ProtocolVersion)
+		<-make(chan int)
 	case "stderr":
 		fmt.Printf("%d|%d|tcp|:1234\n", CoreProtocolVersion, testHandshake.ProtocolVersion)
 		_, _ = os.Stderr.WriteString("HELLO\n")

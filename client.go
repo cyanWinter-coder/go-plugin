@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,6 +76,42 @@ var (
 // defaultPluginLogBufferSize is the default size of the buffer used to read from stderr for plugin log lines.
 const defaultPluginLogBufferSize = 64 * 1024
 
+// defaultExitGracefulTimeout is how long Kill waits for a plugin to shut
+// itself down after being notified before forcefully terminating it.
+const defaultExitGracefulTimeout = 2 * time.Second
+
+// handshakeState tracks the progress of the plugin's initial handshake.
+type handshakeState int
+
+const (
+	// handshakeNotStarted is the state before Start has launched a subprocess.
+	handshakeNotStarted handshakeState = iota
+	// handshakeInProgress means the subprocess is running but has not yet sent
+	// a valid handshake line.
+	handshakeInProgress
+	// handshakeReady means the plugin completed the handshake and the client
+	// has a usable RPC address.
+	handshakeReady
+	// handshakeFailed means the handshake was abandoned because of a timeout,
+	// an invalid response, or the process exiting early.
+	handshakeFailed
+)
+
+func (s handshakeState) String() string {
+	switch s {
+	case handshakeNotStarted:
+		return "not started"
+	case handshakeInProgress:
+		return "in progress"
+	case handshakeReady:
+		return "ready"
+	case handshakeFailed:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
 // Client handles the lifecycle of a plugin application. It launches
 // plugins, connects to them, dispenses interface implementations, and handles
 // killing the process.
@@ -90,6 +127,7 @@ type Client struct {
 	config            *ClientConfig
 	exited            bool
 	l                 sync.Mutex
+	killMu            sync.Mutex
 	address           net.Addr
 	runner            runner.AttachedRunner
 	client            ClientProtocol
@@ -98,6 +136,34 @@ type Client struct {
 	doneCtx           context.Context
 	ctxCancel         context.CancelFunc
 	negotiatedVersion int
+
+	// closed records that Kill has been invoked. Once closed, Start and Client
+	// return ErrClientClosed instead of silently reusing stale state. It is
+	// guarded by l.
+	closed bool
+
+	// stateMu guards exited and exitErr. It is kept separate from l so that
+	// the process reaper goroutine can record the result without holding (or
+	// contending on) l, which Start holds throughout the handshake.
+	stateMu sync.Mutex
+
+	// handshakeState records how far the subprocess got with its initial
+	// protocol handshake. It is guarded by l, which Start holds for its whole
+	// duration.
+	handshakeState handshakeState
+
+	// stderrTail retains the most recent stderr output of the plugin so that
+	// startup and crash errors can include it.
+	stderrTail *stderrTail
+
+	// exitCh receives the ExitError computed by the goroutine that waits on
+	// the plugin process, exactly once. It is buffered and may be nil for
+	// reattached clients.
+	exitCh chan *ExitError
+
+	// exitErr records how the plugin process ended. It is nil until the
+	// process has been reaped and is guarded by l.
+	exitErr *ExitError
 
 	// clientWaitGroup is used to manage the lifecycle of the plugin management
 	// goroutines.
@@ -192,6 +258,15 @@ type ClientConfig struct {
 	// StartTimeout is the timeout to wait for the plugin to say it
 	// has started successfully.
 	StartTimeout time.Duration
+
+	// ExitGracefulTimeout is the maximum time Kill waits for the plugin to
+	// terminate itself after being asked to shut down gracefully (via the RPC
+	// control connection) before forcefully killing its process. If zero, a
+	// default of two seconds is used.
+	//
+	// This only affects plugins started by this client (Cmd or RunnerFunc);
+	// reattached processes are handled by their runner.
+	ExitGracefulTimeout time.Duration
 
 	// If non-nil, then the stderr of the client will be written to here
 	// (as well as the log). This is the original os.Stderr of the subprocess.
@@ -399,6 +474,10 @@ func NewClient(config *ClientConfig) (c *Client) {
 		config.StartTimeout = 1 * time.Minute
 	}
 
+	if config.ExitGracefulTimeout <= 0 {
+		config.ExitGracefulTimeout = defaultExitGracefulTimeout
+	}
+
 	if config.Stderr == nil {
 		config.Stderr = io.Discard
 	}
@@ -476,9 +555,26 @@ func (c *Client) Client() (ClientProtocol, error) {
 
 // Tells whether or not the underlying process has exited.
 func (c *Client) Exited() bool {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.exited
+}
+
+// HandshakeState reports the current state of the plugin's initial handshake.
+// This is primarily intended for diagnostics and testing.
+func (c *Client) HandshakeState() string {
 	c.l.Lock()
 	defer c.l.Unlock()
-	return c.exited
+	return c.handshakeState.String()
+}
+
+// ExitError returns information about how the plugin process ended, including
+// its exit code, any terminating signal, and the tail of its stderr output. It
+// returns nil if the process has not yet exited.
+func (c *Client) ExitError() *ExitError {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	return c.exitErr
 }
 
 // killed is used in tests to check if a process failed to exit gracefully, and
@@ -494,22 +590,36 @@ func (c *Client) killed() bool {
 //
 // This method blocks until the process successfully exits.
 //
-// This method can safely be called multiple times.
+// This method can safely be called multiple times, including concurrently:
+// after the first call has shut the client down, subsequent calls are
+// no-ops. Once Kill has been called, Start and Client return ErrClientClosed
+// instead of reusing the dead process.
 func (c *Client) Kill() {
-	// Grab a lock to read some private fields.
+	// Serialize concurrent Kill calls so the graceful then forced shutdown
+	// sequence runs exactly once.
+	c.killMu.Lock()
+	defer c.killMu.Unlock()
+
+	// Grab a lock to read some private fields and snapshot the closed flag.
 	c.l.Lock()
 	runner := c.runner
 	addr := c.address
 	hostSocketDir := c.unixSocketCfg.socketDir
+	alreadyClosed := c.closed
+	protocolClient := c.client
+	c.closed = true
 	c.l.Unlock()
 
-	// If there is no runner or ID, there is nothing to kill.
-	if runner == nil || runner.ID() == "" {
+	// A second (or later) call has nothing to do. This also covers clients
+	// that were never started, or whose startup failed before a runner existed.
+	if alreadyClosed || runner == nil || runner.ID() == "" {
 		return
 	}
 
 	defer func() {
-		// Wait for the all client goroutines to finish.
+		// Wait for all client goroutines (the process waiter, stdout scanner
+		// and stderr logger) to finish, so the process is fully reaped and no
+		// zombie or open pipe remains before Kill returns.
 		c.clientWaitGroup.Wait()
 
 		if hostSocketDir != "" {
@@ -529,10 +639,25 @@ func (c *Client) Kill() {
 	// the plugin net connections.
 	graceful := false
 	if addr != nil {
-		// Close the client to cleanly exit the process.
-		client, err := c.Client()
-		if err == nil {
-			err = client.Close()
+		// Reuse the already-negotiated protocol client if there is one.
+		// Calling c.Client() here would try to (re)start the closed client.
+		client := protocolClient
+		if client == nil {
+			built, err := c.newProtocolClient()
+			if err != nil {
+				// On error newProtocolClient may return a typed nil wrapped in
+				// the interface; drop it so the nil check below is accurate.
+				c.logger.Error("client", "error", err)
+				client = nil
+			} else {
+				client = built
+			}
+		}
+
+		// Guard against a typed nil wrapped in the interface.
+		if !isNilClient(client) {
+			// Close the client to cleanly exit the process.
+			err := client.Close()
 
 			// If there is no error, then we attempt to wait for a graceful
 			// exit. If there was an error, we assume that graceful cleanup
@@ -543,8 +668,6 @@ func (c *Client) Kill() {
 				// kill in a moment anyways.
 				c.logger.Warn("error closing client during Kill", "err", err)
 			}
-		} else {
-			c.logger.Error("client", "error", err)
 		}
 	}
 
@@ -556,7 +679,7 @@ func (c *Client) Kill() {
 		case <-c.doneCtx.Done():
 			c.logger.Debug("plugin exited")
 			return
-		case <-time.After(2 * time.Second):
+		case <-time.After(c.config.ExitGracefulTimeout):
 		}
 	}
 
@@ -571,15 +694,61 @@ func (c *Client) Kill() {
 	c.l.Unlock()
 }
 
+// newProtocolClient builds the ClientProtocol implementation for a running
+// plugin without mutating the cached c.client field. It is used by Kill when
+// the protocol client was never created (e.g. Start succeeded but Client() was
+// never called). The caller must not hold c.l. On failure it always returns a
+// nil interface so callers can use a plain nil comparison.
+func (c *Client) newProtocolClient() (ClientProtocol, error) {
+	switch c.protocol {
+	case ProtocolNetRPC:
+		client, err := newRPCClient(c)
+		if err != nil {
+			return nil, err
+		}
+		return client, nil
+
+	case ProtocolGRPC:
+		client, err := newGRPCClient(c.doneCtx, c)
+		if err != nil {
+			return nil, err
+		}
+		return client, nil
+
+	default:
+		return nil, fmt.Errorf("unknown server protocol: %s", c.protocol)
+	}
+}
+
+// isNilClient reports whether the protocol client is unusable, covering both
+// the untyped nil case and a typed nil pointer boxed into the interface.
+func isNilClient(client ClientProtocol) bool {
+	if client == nil {
+		return true
+	}
+	v := reflect.ValueOf(client)
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return v.IsNil()
+	default:
+		return false
+	}
+}
+
 // Start the underlying subprocess, communicating with it to negotiate
 // a port for RPC connections, and returning the address to connect via RPC.
 //
-// This method is safe to call multiple times. Subsequent calls have no effect.
-// Once a client has been started once, it cannot be started again, even if
-// it was killed.
+// This method is safe to call multiple times while the client is alive:
+// subsequent calls return the negotiated address without restarting the
+// process. Once a client has been closed with Kill it cannot be started
+// again; this returns ErrClientClosed. Create a new client in that case.
 func (c *Client) Start() (addr net.Addr, err error) {
 	c.l.Lock()
 	defer c.l.Unlock()
+
+	if c.closed {
+		return nil, ErrClientClosed
+	}
 
 	if c.address != nil {
 		return c.address, nil
@@ -729,6 +898,20 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 	}
 
+	// Record the lifecycle state of this handshake attempt.
+	c.stderrTail = newStderrTail(defaultPluginStderrTailSize)
+	c.exitCh = make(chan *ExitError, 1)
+	c.handshakeState = handshakeInProgress
+	defer func() {
+		if err != nil {
+			c.handshakeState = handshakeFailed
+			// A failed handshake leaves a dead process behind; mark the client
+			// closed so a subsequent Start/Client returns ErrClientClosed rather
+			// than silently reusing stale state.
+			c.closed = true
+		}
+	}()
+
 	c.runner = runner
 	startCtx, startCtxCancel := context.WithTimeout(context.Background(), c.config.StartTimeout)
 	defer startCtxCancel()
@@ -738,11 +921,34 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	}
 
 	// Make sure the command is properly cleaned up if there is an error
+	reaped := false
+	forceKilled := false
 	defer func() {
 		rErr := recover()
 
 		if err != nil || rErr != nil {
-			_ = runner.Kill(context.Background())
+			if !reaped {
+				_ = runner.Kill(context.Background())
+				forceKilled = true
+				// Reap the process synchronously so that by the time Start
+				// returns the subprocess is gone (no zombie, no lingering temp
+				// directory) and c.exited/c.exitErr have been recorded.
+				if c.exitCh != nil {
+					select {
+					case <-c.exitCh:
+						reaped = true
+					case <-time.After(c.config.ExitGracefulTimeout):
+					}
+				}
+			}
+			if forceKilled {
+				c.processKilled = true
+			}
+			// The client is marked closed, so a later Kill will short-circuit;
+			// remove the socket directory here rather than relying on Kill.
+			if c.unixSocketCfg.socketDir != "" {
+				_ = os.RemoveAll(c.unixSocketCfg.socketDir)
+			}
 		}
 
 		if rErr != nil {
@@ -760,7 +966,7 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	// Start goroutine that logs the stderr
 	c.clientWaitGroup.Add(1)
 	// logStderr calls c.pipesWaitGroup.Done()
-	go c.logStderr(runner.Name(), runner.Stderr())
+	go c.logStderr(runner.Name(), runner.Stderr(), c.stderrTail)
 
 	c.clientWaitGroup.Add(1)
 	go func() {
@@ -774,9 +980,10 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		c.pipesWaitGroup.Wait()
 
 		// Wait for the command to end.
-		err := runner.Wait(context.Background())
-		if err != nil {
-			c.logger.Error("plugin process exited", "plugin", runner.Name(), "id", runner.ID(), "error", err.Error())
+		waitErr := runner.Wait(context.Background())
+		exitErr := newExitError(waitErr, c.stderrTail)
+		if waitErr != nil {
+			c.logger.Error("plugin process exited", "plugin", runner.Name(), "id", runner.ID(), "error", waitErr.Error())
 		} else {
 			// Log and make sure to flush the logs right away
 			c.logger.Info("plugin process exited", "plugin", runner.Name(), "id", runner.ID())
@@ -784,10 +991,17 @@ func (c *Client) Start() (addr net.Addr, err error) {
 
 		_ = os.Stderr.Sync()
 
-		// Set that we exited, which takes a lock
-		c.l.Lock()
-		defer c.l.Unlock()
+		// Record how the process ended and publish it. We use stateMu rather
+		// than l because Start holds l throughout the handshake and may be
+		// waiting on exitCh below; taking l here would deadlock.
+		c.stateMu.Lock()
+		c.exitErr = exitErr
 		c.exited = true
+		c.stateMu.Unlock()
+
+		// Publish after recording. The channel is buffered, so this never
+		// blocks and a Start waiting on it will observe the stored state too.
+		c.exitCh <- exitErr
 	}()
 
 	// Start a goroutine that is going to be reading the lines
@@ -828,10 +1042,45 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	c.logger.Debug("waiting for RPC address", "plugin", runner.Name())
 	select {
 	case <-timeout:
-		err = errors.New("timeout while waiting for plugin to start")
+		// The plugin did not finish the handshake in time. Stop it and wait
+		// for the process to be reaped so no zombie or lingering process (or
+		// its temporary directory) survives the failed start.
+		if killErr := runner.Kill(context.Background()); killErr != nil {
+			c.logger.Debug("error killing plugin after start timeout", "error", killErr)
+		}
+		forceKilled = true
+		exitErr := c.waitForExitError(c.config.ExitGracefulTimeout)
+		reaped = true
+		err = fmt.Errorf("%w: %s", ErrPluginStartTimeout, exitSummary(exitErr, c.stderrTail))
 	case <-c.doneCtx.Done():
-		err = errors.New("plugin exited before we could connect")
+		// The process ended before producing a handshake. Wait for the reaper
+		// to record the exit details so the error can distinguish a clean exit
+		// from a crash and include the stderr tail.
+		exitErr := c.waitForExitError(c.config.ExitGracefulTimeout)
+		reaped = true
+		switch {
+		case exitErr != nil && exitErr.Crashed():
+			err = fmt.Errorf("%w: %w", ErrPluginExited, exitErr)
+		default:
+			err = fmt.Errorf("%w: %s", ErrPluginExited, exitSummary(exitErr, c.stderrTail))
+		}
 	case line, ok := <-linesCh:
+		// If the stdout pipe closed without a handshake line, the process has
+		// gone away. Wait briefly for the reaper so we report the real exit
+		// cause (exit code/signal plus stderr tail) instead of a generic
+		// "unrecognized message" error.
+		if !ok {
+			exitErr := c.waitForExitError(c.config.ExitGracefulTimeout)
+			reaped = true
+			switch {
+			case exitErr != nil && exitErr.Crashed():
+				err = fmt.Errorf("%w: %w", ErrPluginExited, exitErr)
+			default:
+				err = fmt.Errorf("%w: %s", ErrPluginExited, exitSummary(exitErr, c.stderrTail))
+			}
+			return
+		}
+
 		// Trim the line and split by "|" in order to get the parts of
 		// the output.
 		line = strings.TrimSpace(line)
@@ -944,7 +1193,39 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	}
 
 	c.address = addr
+	c.handshakeState = handshakeReady
 	return
+}
+
+// waitForExitError blocks until the process waiter goroutine publishes the
+// ExitError, or until wait elapses. On timeout it snapshots whatever stderr has
+// been captured so the caller still gets a useful error. It must be called
+// while holding c.l (Start holds it for its whole duration). The value is
+// consumed from the channel; the waiter goroutine also stores it on the client,
+// which is what Kill (after waiting for the goroutines) reads.
+func (c *Client) waitForExitError(wait time.Duration) *ExitError {
+	if c.exitCh == nil {
+		return nil
+	}
+
+	select {
+	case exitErr := <-c.exitCh:
+		return exitErr
+	case <-time.After(wait):
+		return &ExitError{ExitCode: -1, Stderr: tailString(c.stderrTail)}
+	}
+}
+
+// exitSummary renders an ExitError for inclusion in a startup error, falling
+// back to the retained stderr when the process has not been reaped yet.
+func exitSummary(exitErr *ExitError, stderr *stderrTail) string {
+	if exitErr != nil {
+		return exitErr.Error()
+	}
+	if s := tailString(stderr); s != "" {
+		return s
+	}
+	return "no exit status available"
 }
 
 // loadServerCert is used by AutoMTLS to read an x.509 cert returned by the
@@ -993,15 +1274,17 @@ func (c *Client) reattach() (net.Addr, error) {
 		defer c.ctxCancel()
 
 		// Wait for the process to die
-		_ = r.Wait(context.Background())
+		waitErr := r.Wait(context.Background())
 
 		// Log so we can see it
 		c.logger.Debug("reattached plugin process exited")
 
-		// Mark it
-		c.l.Lock()
-		defer c.l.Unlock()
+		// Mark it. stateMu is used rather than l so this can never deadlock
+		// with Start, which holds l.
+		c.stateMu.Lock()
+		c.exitErr = newExitError(waitErr, nil)
 		c.exited = true
+		c.stateMu.Unlock()
 	}(r)
 
 	// Set the address and protocol
@@ -1011,6 +1294,9 @@ func (c *Client) reattach() (net.Addr, error) {
 		// Default the protocol to net/rpc for backwards compatibility
 		c.protocol = ProtocolNetRPC
 	}
+
+	// A reattached process has already completed its handshake elsewhere.
+	c.handshakeState = handshakeReady
 
 	if c.config.Reattach.Test {
 		c.negotiatedVersion = c.config.Reattach.ProtocolVersion
@@ -1166,7 +1452,7 @@ func (c *Client) getGRPCMuxer(addr net.Addr) (*grpcmux.GRPCClientMuxer, error) {
 	return c.grpcMuxer, nil
 }
 
-func (c *Client) logStderr(name string, r io.Reader) {
+func (c *Client) logStderr(name string, r io.Reader, tail *stderrTail) {
 	defer c.clientWaitGroup.Done()
 	defer c.pipesWaitGroup.Done()
 
@@ -1182,6 +1468,15 @@ func (c *Client) logStderr(name string, r io.Reader) {
 	// remaining untagged lines to stderr
 	var inPanic bool
 
+	// writeStderr forwards plugin output both to the user-configured writer and
+	// the bounded ring buffer used for crash diagnostics.
+	writeStderr := func(p []byte) {
+		_, _ = c.config.Stderr.Write(p)
+		if tail != nil {
+			_, _ = tail.Write(p)
+		}
+	}
+
 	for {
 
 		line, isPrefix, err := reader.ReadLine()
@@ -1193,7 +1488,7 @@ func (c *Client) logStderr(name string, r io.Reader) {
 			return
 		}
 
-		_, _ = c.config.Stderr.Write(line)
+		writeStderr(line)
 
 		// The line was longer than our max token size, so it's likely
 		// incomplete and won't unmarshal.
@@ -1202,14 +1497,14 @@ func (c *Client) logStderr(name string, r io.Reader) {
 
 			// if we're finishing a continued line, add the newline back in
 			if !isPrefix {
-				_, _ = c.config.Stderr.Write([]byte{'\n'})
+				writeStderr([]byte{'\n'})
 			}
 
 			continuation = isPrefix
 			continue
 		}
 
-		_, _ = c.config.Stderr.Write([]byte{'\n'})
+		writeStderr([]byte{'\n'})
 
 		//
 		// Any side-effects other than writing to the hclog logger must be

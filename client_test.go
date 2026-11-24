@@ -1640,11 +1640,17 @@ this line is short
 	reader := strings.NewReader(msg)
 
 	c.pipesWaitGroup.Add(1)
-	c.logStderr(c.config.Cmd.Path, reader)
+	tail := newStderrTail(defaultPluginStderrTailSize)
+	c.logStderr(c.config.Cmd.Path, reader, tail)
 	read := stderr.String()
 
 	if read != msg {
 		t.Fatalf("\nexpected output: %q\ngot output:      %q", msg, read)
+	}
+
+	// The tail buffer retains the most recent stderr verbatim.
+	if got := tail.String(); !strings.HasSuffix(msg, got) || got == "" {
+		t.Fatalf("stderr tail should retain the end of the output, got %q", got)
 	}
 }
 
@@ -1668,7 +1674,7 @@ func TestClient_logStderrParseJSON(t *testing.T) {
 	reader := strings.NewReader(msg)
 
 	c.pipesWaitGroup.Add(1)
-	c.logStderr(c.config.Cmd.Path, reader)
+	c.logStderr(c.config.Cmd.Path, reader, newStderrTail(defaultPluginStderrTailSize))
 	logs := strings.Split(strings.TrimSpace(logBuf.String()), "\n")
 
 	wants := []struct {

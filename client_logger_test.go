@@ -44,7 +44,7 @@ func BenchmarkClientLogging(b *testing.B) {
 			c.clientWaitGroup.Add(1)
 			c.pipesWaitGroup.Add(1)
 			// logStderr calls Done() on both waitgroups
-			go c.logStderr("test", r)
+			go c.logStderr("test", r, newStderrTail(defaultPluginStderrTailSize))
 
 			fakeLogLine := []byte("{\"@level\":\"debug\",\"@timestamp\":\"2006-01-02T15:04:05.000000Z\",\"@message\":\"hello\",\"extra\":\"hi\",\"numbers\":[1,2,3]}\n")
 			for b.Loop() {
