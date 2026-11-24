@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin/internal/grpcmux"
@@ -25,6 +27,13 @@ import (
 // return as passing.
 const GRPCServiceName = "plugin"
 
+// grpcGracefulStopGrace is the time GRPCServer.Shutdown gives the gRPC
+// server to drain in-flight RPCs after plugins have been notified before
+// it forces a stop. It is deliberately short: the client-side graceful
+// shutdown window is only a couple of seconds and long-lived streams such
+// as the stdio stream keep GracefulStop from ever returning on its own.
+const grpcGracefulStopGrace = 250 * time.Millisecond
+
 // DefaultGRPCServer can be used with the "GRPCServer" field for Server
 // as a default factory method to create a gRPC server with no extra options.
 func DefaultGRPCServer(opts []grpc.ServerOption) *grpc.Server {
@@ -39,6 +48,12 @@ func DefaultGRPCServer(opts []grpc.ServerOption) *grpc.Server {
 type GRPCServer struct {
 	// Plugins are the list of plugins to serve.
 	Plugins map[string]Plugin
+
+	// Registry is the validated plugin registry used for name-based
+	// routing and lifecycle management. When nil, Init builds one from
+	// Plugins and rejects duplicate names. When set, it takes precedence
+	// over Plugins.
+	Registry *PluginRegistry
 
 	// Server is the actual server that will accept connections. This
 	// will be used for plugin registration as well.
@@ -56,6 +71,11 @@ type GRPCServer struct {
 	Stdout io.Reader
 	Stderr io.Reader
 
+	// ShutdownTimeout bounds how long Shutdown waits for plugins that
+	// implement io.Closer to drain before forcibly stopping the gRPC
+	// server. A zero value uses the package default.
+	ShutdownTimeout time.Duration
+
 	config      GRPCServerConfig
 	server      *grpc.Server
 	broker      *GRPCBroker
@@ -64,10 +84,28 @@ type GRPCServer struct {
 	logger hclog.Logger
 
 	muxer *grpcmux.GRPCServerMuxer
+
+	// shutdownOnce serializes Shutdown so a controller-triggered shutdown
+	// and a context-canceled shutdown cannot run concurrently and race on
+	// the broker/server fields.
+	shutdownOnce sync.Once
+	shutdownDone chan struct{}
+	shutdownErr  error
 }
 
 // ServerProtocol impl.
 func (s *GRPCServer) Init() error {
+	// Build the registry from the plugin set so duplicate names fail with
+	// an explicit error rather than one registration silently replacing
+	// the other.
+	if s.Registry == nil {
+		registry, err := NewPluginRegistry(s.Plugins)
+		if err != nil {
+			return err
+		}
+		s.Registry = registry
+	}
+
 	// Create our server
 	var opts []grpc.ServerOption
 	if s.TLS != nil {
@@ -98,18 +136,26 @@ func (s *GRPCServer) Init() error {
 	s.stdioServer = newGRPCStdioServer(s.logger, s.Stdout, s.Stderr)
 	plugin.RegisterGRPCStdioServer(s.server, s.stdioServer)
 
-	// Register all our plugins onto the gRPC server.
-	for k, raw := range s.Plugins {
+	// Register all our plugins onto the gRPC server. Iterating the
+	// registry (rather than the raw map) guarantees both unique names and
+	// deterministic registration order.
+	for _, info := range s.Registry.List() {
+		raw, err := s.Registry.Lookup(info.Name)
+		if err != nil {
+			return err
+		}
+
 		p, ok := raw.(GRPCPlugin)
 		if !ok {
-			return fmt.Errorf("%q is not a GRPC-compatible plugin", k)
+			return fmt.Errorf("%q is not a GRPC-compatible plugin", info.Name)
 		}
 
 		if err := p.GRPCServer(s.broker, s.server); err != nil {
-			return fmt.Errorf("error registering %q: %s", k, err)
+			return fmt.Errorf("error registering %q: %s", info.Name, err)
 		}
 	}
 
+	s.Registry.markServing()
 	return nil
 }
 
@@ -117,7 +163,12 @@ func (s *GRPCServer) Init() error {
 // grpc.Broker if present.
 func (s *GRPCServer) Stop() {
 	s.server.Stop()
+	s.closeBroker()
+}
 
+// closeBroker closes the broker exactly once. It is safe for concurrent
+// use with Shutdown.
+func (s *GRPCServer) closeBroker() {
 	if s.broker != nil {
 		_ = s.broker.Close()
 		s.broker = nil
@@ -128,11 +179,66 @@ func (s *GRPCServer) Stop() {
 // the underlying grpc.Broker if present.
 func (s *GRPCServer) GracefulStop() {
 	s.server.GracefulStop()
+	s.closeBroker()
+}
 
-	if s.broker != nil {
-		_ = s.broker.Close()
-		s.broker = nil
+// Shutdown performs an orderly server shutdown. It first notifies every
+// registered plugin (plugins implementing io.Closer have Close called on
+// them concurrently) and waits for them to exit, bounded by
+// ShutdownTimeout. The gRPC server is then given a short grace period to
+// drain in-flight RPCs, after which it is forcibly stopped so a
+// long-lived stream or unresponsive connection cannot hang the process.
+//
+// Shutdown is idempotent: concurrent or repeated calls block until the
+// first shutdown completes and return the same error.
+func (s *GRPCServer) Shutdown() error {
+	s.shutdownOnce.Do(func() {
+		// Created here rather than in Init so Shutdown is also safe on a
+		// server driven without the full Init/Serve lifecycle. Reads of
+		// shutdownDone below happen after Do returns, which establishes a
+		// happens-before edge with this write.
+		s.shutdownDone = make(chan struct{})
+		defer close(s.shutdownDone)
+		s.shutdownErr = s.doShutdown()
+	})
+
+	<-s.shutdownDone
+	return s.shutdownErr
+}
+
+func (s *GRPCServer) doShutdown() error {
+	timeout := s.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = defaultPluginShutdownTimeout
 	}
+
+	// Notify plugins and wait for them to drain. The registry itself
+	// enforces the timeout and marks every plugin stopped afterwards.
+	err := s.Registry.Shutdown(timeout)
+
+	// GracefulStop blocks until all outstanding RPCs finish. Run it
+	// concurrently with a hard Stop so an unresponsive connection cannot
+	// extend the shutdown past a short, fixed grace period.
+	timer := time.NewTimer(grpcGracefulStopGrace)
+	defer timer.Stop()
+
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		s.server.GracefulStop()
+	}()
+
+	select {
+	case <-stopped:
+	case <-timer.C:
+		s.logger.Warn("graceful stop timed out, forcing server stop",
+			"grace", grpcGracefulStopGrace)
+		s.Stop()
+		<-stopped
+	}
+
+	s.closeBroker()
+	return err
 }
 
 // Config is the GRPCServerConfig encoded as JSON then base64.

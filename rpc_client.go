@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/rpc"
+	"strings"
 
 	"github.com/hashicorp/yamux"
 )
@@ -145,12 +146,17 @@ func (c *RPCClient) Close() error {
 func (c *RPCClient) Dispense(name string) (interface{}, error) {
 	p, ok := c.plugins[name]
 	if !ok {
-		return nil, fmt.Errorf("unknown plugin type: %s", name)
+		return nil, fmt.Errorf("%w: %s", ErrPluginNotFound, name)
 	}
 
 	var id uint32
 	if err := c.control.Call(
 		"Dispenser.Dispense", name, &id); err != nil {
+		// The net/rpc transport only preserves the error message, so match
+		// on the stable sentinel text and re-wrap it to restore errors.Is.
+		if strings.HasPrefix(err.Error(), ErrPluginNotFound.Error()) {
+			return nil, fmt.Errorf("%w: %s", ErrPluginNotFound, name)
+		}
 		return nil, err
 	}
 

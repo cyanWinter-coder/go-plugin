@@ -5,6 +5,7 @@ SECURITY:
 
 ENHANCEMENTS:
 * deps: Removed direct use of deprecated `github.com/golang/protobuf` in favour of `google.golang.org/protobuf` [[GH-388](https://github.com/hashicorp/go-plugin/pull/388)]
+* Server: Plugin names are now validated for uniqueness through a new `PluginRegistry`; duplicate registration returns `ErrPluginAlreadyRegistered` instead of silently overwriting the previous plugin, unknown names return an `ErrPluginNotFound`-wrapped error, registry entries and plugin lifecycle status are queryable, and server shutdown notifies every plugin implementing `io.Closer` and waits (bounded by `ServeConfig.ShutdownTimeout`) before forcibly closing connections. Existing `ServeConfig` fields and the handshake flow are unchanged.
 
 ## v1.7.0
 

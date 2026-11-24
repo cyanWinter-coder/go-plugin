@@ -5,12 +5,12 @@ package plugin
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/rpc"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/yamux"
 )
@@ -23,6 +23,12 @@ import (
 type RPCServer struct {
 	Plugins map[string]Plugin
 
+	// Registry is the validated plugin registry used for name-based
+	// routing and lifecycle management. When nil, Init builds one from
+	// Plugins and rejects duplicate names. When set, it takes precedence
+	// over Plugins.
+	Registry *PluginRegistry
+
 	// Stdout, Stderr are what this server will use instead of the
 	// normal stdin/out/err. This is because due to the multi-process nature
 	// of our plugin system, we can't use the normal process values so we
@@ -34,11 +40,42 @@ type RPCServer struct {
 	// when the control requests the RPC server to end.
 	DoneCh chan<- struct{}
 
+	// ShutdownTimeout bounds how long Shutdown waits for plugins that
+	// implement io.Closer to drain before the listener is forcibly closed.
+	// A zero value uses the package default.
+	ShutdownTimeout time.Duration
+
 	lock sync.Mutex
+
+	// lis is retained so Shutdown can unblock the Accept loop.
+	lis net.Listener
+
+	// shutdownOnce makes Shutdown idempotent when triggered concurrently
+	// through the control Quit RPC and context cancellation.
+	shutdownOnce sync.Once
+	shutdownDone chan struct{}
+	shutdownErr  error
 }
 
 // ServerProtocol impl.
-func (s *RPCServer) Init() error { return nil }
+func (s *RPCServer) Init() error {
+	return s.ensureRegistry()
+}
+
+// ensureRegistry builds the registry from the plugin map on first use so
+// duplicate names are rejected with an explicit error even when the server
+// is driven directly through ServeConn (as the test helpers do).
+func (s *RPCServer) ensureRegistry() error {
+	if s.Registry != nil {
+		return nil
+	}
+	registry, err := NewPluginRegistry(s.Plugins)
+	if err != nil {
+		return err
+	}
+	s.Registry = registry
+	return nil
+}
 
 // ServerProtocol impl.
 func (s *RPCServer) Config() string { return "" }
@@ -46,6 +83,15 @@ func (s *RPCServer) Config() string { return "" }
 // ServerProtocol impl.
 func (s *RPCServer) Serve(lis net.Listener) {
 	defer s.done()
+
+	if err := s.ensureRegistry(); err != nil {
+		log.Printf("[ERR] plugin: plugin server init: %s", err)
+		return
+	}
+	s.lock.Lock()
+	s.lis = lis
+	s.lock.Unlock()
+	s.Registry.markServing()
 
 	for {
 		conn, err := lis.Accept()
@@ -62,10 +108,53 @@ func (s *RPCServer) Serve(lis net.Listener) {
 	}
 }
 
+// Shutdown performs an orderly net/rpc server shutdown. Every registered
+// plugin implementing io.Closer is notified concurrently and the server
+// waits for them to exit, bounded by ShutdownTimeout. The listener is then
+// closed to unblock the Accept loop and any in-flight connections, which
+// is the forceful stop available to net/rpc.
+//
+// Shutdown is idempotent: concurrent or repeated calls block until the
+// first shutdown completes and return the same error.
+func (s *RPCServer) Shutdown() error {
+	s.shutdownOnce.Do(func() {
+		s.shutdownDone = make(chan struct{})
+		defer close(s.shutdownDone)
+		s.shutdownErr = s.doShutdown()
+	})
+
+	<-s.shutdownDone
+	return s.shutdownErr
+}
+
+func (s *RPCServer) doShutdown() error {
+	timeout := s.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = defaultPluginShutdownTimeout
+	}
+
+	var err error
+	if s.Registry != nil {
+		err = s.Registry.Shutdown(timeout)
+	}
+	s.lock.Lock()
+	lis := s.lis
+	s.lock.Unlock()
+	if lis != nil {
+		_ = lis.Close()
+	}
+	return err
+}
+
 // ServeConn runs a single connection.
 //
 // ServeConn blocks, serving the connection until the client hangs up.
 func (s *RPCServer) ServeConn(conn io.ReadWriteCloser) {
+	if err := s.ensureRegistry(); err != nil {
+		_ = conn.Close()
+		log.Printf("[ERR] plugin: plugin server init: %s", err)
+		return
+	}
 	// First create the yamux server to wrap this connection
 	mux, err := yamux.Server(conn, nil)
 	if err != nil {
@@ -111,8 +200,8 @@ func (s *RPCServer) ServeConn(conn io.ReadWriteCloser) {
 		server: s,
 	})
 	_ = server.RegisterName("Dispenser", &dispenseServer{
-		broker:  broker,
-		plugins: s.Plugins,
+		broker:   broker,
+		registry: s.Registry,
 	})
 	server.ServeConn(control)
 }
@@ -158,18 +247,22 @@ func (c *controlServer) Quit(
 
 // dispenseServer dispenses variousinterface implementations for Terraform.
 type dispenseServer struct {
-	broker  *MuxBroker
-	plugins map[string]Plugin
+	broker   *MuxBroker
+	registry *PluginRegistry
 }
 
 func (d *dispenseServer) Dispense(
 	name string, response *uint32,
 ) error {
-	// Find the function to create this implementation
-	p, ok := d.plugins[name]
-	if !ok {
-		return fmt.Errorf("unknown plugin type: %s", name)
+	// Route the request to the registered implementation. An unknown
+	// name wraps ErrPluginNotFound so callers can identify the condition
+	// via errors.Is when running in-process; net/rpc clients match on the
+	// stable sentinel message text.
+	p, err := d.registry.Lookup(name)
+	if err != nil {
+		return errors.New(err.Error())
 	}
+	d.registry.setStatus(name, PluginStatusServing)
 
 	// Create the implementation first so we know if there is an error.
 	impl, err := p.Server(d.broker)

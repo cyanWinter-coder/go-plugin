@@ -15,12 +15,16 @@ type grpcControllerServer struct {
 	server *GRPCServer
 }
 
-// Shutdown stops the grpc server. It first will attempt a graceful stop, then a
-// full stop on the server.
+// Shutdown stops the grpc server. Plugins are notified first and given up
+// to the server's ShutdownTimeout to exit before the server is forcibly
+// stopped.
+//
+// GracefulStop cannot be called directly from this handler because it waits
+// for outstanding RPCs, including the Shutdown call currently being
+// served, to complete. The shutdown is therefore performed in its own
+// goroutine and the response is returned immediately.
 func (s *grpcControllerServer) Shutdown(ctx context.Context, _ *plugin.Empty) (*plugin.Empty, error) {
 	resp := &plugin.Empty{}
-
-	// TODO: figure out why GracefullStop doesn't work.
-	s.server.Stop()
+	go func() { _ = s.server.Shutdown() }()
 	return resp, nil
 }

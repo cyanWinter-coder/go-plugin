@@ -62,6 +62,32 @@ Where:
     also be "grpc". This is the protocol that the plugin wants to speak to
     the host process with.
 
+## Server-side plugin registry
+
+Each plugin server keeps its plugins in an in-memory `PluginRegistry`. The
+registry enforces three rules:
+
+  * Plugin names are unique. Registering a duplicate name returns
+    `ErrPluginAlreadyRegistered` and leaves the existing entry untouched,
+    rather than letting the later registration silently overwrite the
+    earlier one. Empty names and nil implementations are rejected as well.
+  * Routing is by exact name. A `Dispense` (or net/rpc `Dispenser.Dispense`)
+    call for an unknown name returns an error wrapping
+    `ErrPluginNotFound`, which stays identifiable with `errors.Is` on both
+    the gRPC and net/rpc transports.
+  * Every entry carries a lifecycle status (`registered`, `serving`,
+    `stopped`) that can be queried with `Registry.Get`, `Registry.List`,
+    `Registry.Names` and `Registry.Len`. The registry is process-local, so
+    restarting the server always starts from an empty registry; no stale
+    entries survive a restart.
+
+A pre-built registry can be supplied through `ServeConfig.Registry`. When
+the server shuts down, every plugin implementing `io.Closer` is notified
+concurrently and the server waits for them to exit, bounded by
+`ServeConfig.ShutdownTimeout` (default 5 seconds). Once the timeout
+elapses, connections are forcibly closed so a misbehaving plugin cannot
+hang the process.
+
 ## Environment Variables
 
 When serving a plugin over TCP, the following environment variables can be

@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-plugin/internal/grpcmux"
@@ -74,6 +75,19 @@ type ServeConfig struct {
 	// These can be used to negotiate a compatible version between client and
 	// server. If this is set, Handshake.ProtocolVersion is not required.
 	VersionedPlugins map[int]PluginSet
+
+	// Registry is an optional, pre-built server-side plugin registry. When
+	// set it enforces unique plugin names and supplies the plugins served
+	// for the negotiated protocol version, taking precedence over
+	// Plugins/VersionedPlugins when both contain a name. A name present in
+	// both the registry and the negotiated PluginSet is reported as an
+	// error instead of being overwritten.
+	Registry *PluginRegistry
+
+	// ShutdownTimeout bounds how long the server waits for plugins to
+	// exit after notifying them on shutdown before forcibly closing
+	// connections. Defaults to 5 seconds when zero.
+	ShutdownTimeout time.Duration
 
 	// GRPCServer should be non-nil to enable serving the plugins over
 	// gRPC. This is a function to create the server when needed with the
@@ -369,6 +383,19 @@ func Serve(opts *ServeConfig) {
 		stderr_r = io.TeeReader(stderr_r, os.Stderr)
 	}
 
+	// Build the validated registry for the negotiated plugin set. A
+	// user-supplied registry is merged with the negotiated PluginSet so
+	// that duplicate names fail loudly here instead of one plugin silently
+	// replacing another.
+	registry, err := buildServerRegistry(opts.Registry, pluginSet)
+	if err != nil {
+		logger.Error("plugin registry error", "error", err)
+		return
+	}
+	// Expose the registry on the config so callers can query registered
+	// plugins and their lifecycle state while the server is running.
+	opts.Registry = registry
+
 	// Build the server type
 	var server ServerProtocol
 	switch protoType {
@@ -381,10 +408,12 @@ func Serve(opts *ServeConfig) {
 
 		// Create the RPC server to dispense
 		server = &RPCServer{
-			Plugins: pluginSet,
-			Stdout:  stdout_r,
-			Stderr:  stderr_r,
-			DoneCh:  doneCh,
+			Plugins:         pluginSet,
+			Registry:        registry,
+			Stdout:          stdout_r,
+			Stderr:          stderr_r,
+			DoneCh:          doneCh,
+			ShutdownTimeout: opts.ShutdownTimeout,
 		}
 
 	case ProtocolGRPC:
@@ -396,14 +425,16 @@ func Serve(opts *ServeConfig) {
 
 		// Create the gRPC server
 		server = &GRPCServer{
-			Plugins: pluginSet,
-			Server:  opts.GRPCServer,
-			TLS:     tlsConfig,
-			Stdout:  stdout_r,
-			Stderr:  stderr_r,
-			DoneCh:  doneCh,
-			logger:  logger,
-			muxer:   muxer,
+			Plugins:         pluginSet,
+			Registry:        registry,
+			Server:          opts.GRPCServer,
+			TLS:             tlsConfig,
+			Stdout:          stdout_r,
+			Stderr:          stderr_r,
+			DoneCh:          doneCh,
+			ShutdownTimeout: opts.ShutdownTimeout,
+			logger:          logger,
+			muxer:           muxer,
 		}
 
 	default:
@@ -502,16 +533,17 @@ func Serve(opts *ServeConfig) {
 	}
 	select {
 	case <-ctx.Done():
-		// Cancellation. We can stop the server by closing the listener.
-		// This isn't graceful at all but this is currently only used by
-		// tests and its our only way to stop.
-		_ = listener.Close()
-
-		// If this is a grpc server, then we also ask the server itself to
-		// end which will kill all connections. There isn't an easy way to do
-		// this for net/rpc currently but net/rpc is more and more unused.
-		if s, ok := server.(*GRPCServer); ok {
-			s.Stop()
+		// Cancellation. Shut down through the protocol-specific path:
+		// plugins implementing io.Closer are notified and given
+		// ShutdownTimeout to exit, after which connections are forcibly
+		// closed. net/rpc has no graceful equivalent, so closing its
+		// listener (done inside Shutdown) is the forceful stop.
+		if s, ok := server.(interface{ Shutdown() error }); ok {
+			if err := s.Shutdown(); err != nil {
+				logger.Warn("plugin shutdown returned errors", "error", err)
+			}
+		} else {
+			_ = listener.Close()
 		}
 
 		// Wait for the server itself to shut down
@@ -523,6 +555,35 @@ func Serve(opts *ServeConfig) {
 		// work before extracting this library. However, for years we've done
 		// this so we'll keep this functionality.
 	}
+}
+
+// buildServerRegistry produces the registry used by a server instance.
+//
+// When no caller-supplied registry exists, the negotiated plugin set is
+// validated on its own, which rejects duplicate names, empty names and nil
+// implementations before the server starts listening.
+//
+// When a caller-supplied registry exists, every entry of the negotiated
+// plugin set is added to it. A name already present in the registry is an
+// error rather than a silent overwrite.
+func buildServerRegistry(existing *PluginRegistry, pluginSet PluginSet) (*PluginRegistry, error) {
+	if existing == nil {
+		return NewPluginRegistry(pluginSet)
+	}
+
+	// Deterministic order keeps failures and registration stable.
+	names := make([]string, 0, len(pluginSet))
+	for name := range pluginSet {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		if err := existing.Register(name, pluginSet[name]); err != nil {
+			return nil, err
+		}
+	}
+	return existing, nil
 }
 
 func serverListener(unixSocketCfg UnixSocketConfig) (net.Listener, error) {
