@@ -589,6 +589,25 @@ func TestHelperProcess(*testing.T) {
 
 		// Shouldn't reach here but make sure we exit anyways
 		os.Exit(0)
+	case "test-interface-named":
+		// Serves a net/rpc plugin that participates in the in-band
+		// handshake under the name passed as the first argument.
+		pluginName := "named-test-plugin"
+		if len(args) > 0 {
+			pluginName = args[0]
+		}
+		Serve(&ServeConfig{
+			HandshakeConfig: HandshakeConfig{
+				ProtocolVersion:  testHandshake.ProtocolVersion,
+				Name:             pluginName,
+				MagicCookieKey:   testHandshake.MagicCookieKey,
+				MagicCookieValue: testHandshake.MagicCookieValue,
+			},
+			Plugins: testPluginMap,
+		})
+
+		// Shouldn't reach here but make sure we exit anyways
+		os.Exit(0)
 	case "test-interface-logger-netrpc":
 		Serve(&ServeConfig{
 			HandshakeConfig: testHandshake,

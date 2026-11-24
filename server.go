@@ -46,6 +46,13 @@ type HandshakeConfig struct {
 	// Client or Server configurations.
 	ProtocolVersion uint
 
+	// Name is the logical plugin name exchanged during the in-band RPC
+	// handshake. When set, both the host and the plugin must use the same
+	// value or the connection is rejected with an ErrPluginNameMismatch
+	// error before any RPC traffic is exchanged. An empty value disables
+	// name verification and preserves the historical behavior.
+	Name string
+
 	// MagicCookieKey and value are used as a very basic verification
 	// that a plugin is intended to be launched. This is not a security
 	// measure, just a UX feature. If the magic cookie doesn't match,
@@ -221,6 +228,19 @@ func protocolVersion(opts *ServeConfig) (int, Protocol, PluginSet) {
 	return protoVersion, protoType, pluginSet
 }
 
+// supportedProtocolVersions returns the set of protocol versions this server
+// is configured to serve, used by the in-band RPC handshake.
+func supportedProtocolVersions(opts *ServeConfig) map[int]struct{} {
+	versions := make(map[int]struct{}, len(opts.VersionedPlugins)+1)
+	for v := range opts.VersionedPlugins {
+		versions[v] = struct{}{}
+	}
+	if opts.Plugins != nil {
+		versions[int(opts.ProtocolVersion)] = struct{}{}
+	}
+	return versions
+}
+
 // Serve serves the plugins given by ServeConfig.
 //
 // Serve doesn't return until the plugin is done being executed. Any
@@ -381,10 +401,12 @@ func Serve(opts *ServeConfig) {
 
 		// Create the RPC server to dispense
 		server = &RPCServer{
-			Plugins: pluginSet,
-			Stdout:  stdout_r,
-			Stderr:  stderr_r,
-			DoneCh:  doneCh,
+			Plugins:          pluginSet,
+			Stdout:           stdout_r,
+			Stderr:           stderr_r,
+			DoneCh:           doneCh,
+			Name:             opts.Name,
+			ProtocolVersions: supportedProtocolVersions(opts),
 		}
 
 	case ProtocolGRPC:

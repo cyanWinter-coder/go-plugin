@@ -620,6 +620,15 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		c.config.VersionedPlugins = make(map[int]PluginSet)
 	}
 
+	// Validate the locally configured handshake before spawning a
+	// subprocess or creating any temporary state. A name or protocol
+	// version that can never be accepted must fail fast: no plugin
+	// process is started and no log files or socket directories are
+	// created.
+	if err := c.validateHandshake(); err != nil {
+		return nil, err
+	}
+
 	// handle all plugins as versioned, using the handshake config as the default.
 	version := int(c.config.ProtocolVersion)
 
@@ -1023,6 +1032,25 @@ func (c *Client) reattach() (net.Addr, error) {
 	}
 
 	return c.address, nil
+}
+
+// validateHandshake checks the locally verifiable handshake configuration
+// before any subprocess is started. It lets the client reject configurations
+// that can never succeed with typed errors, so no plugin process is launched
+// and no log files or temporary directories are created. Name and protocol
+// version agreement with the actual plugin binary is enforced afterwards by
+// the in-band handshake; here we only validate what is knowable without
+// starting the process.
+func (c *Client) validateHandshake() error {
+	// A named handshake requires the magic cookie as well; without it the
+	// plugin could never prove it is the named component.
+	if c.config.Name != "" &&
+		(c.config.MagicCookieKey == "" || c.config.MagicCookieValue == "") {
+		return fmt.Errorf("%w: plugin name %q requires a magic cookie in the handshake configuration",
+			ErrPluginNameMismatch, c.config.Name)
+	}
+
+	return nil
 }
 
 // checkProtoVersion returns the negotiated version and PluginSet.

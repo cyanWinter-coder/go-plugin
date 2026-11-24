@@ -1,14 +1,17 @@
-// Copyright IBM Corp. 2016, 2025
+// Copyright IBM Corp. 2016, 2026
 // SPDX-License-Identifier: MPL-2.0
 
 package plugin
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/rpc"
+	"sync"
+	"time"
 
 	"github.com/hashicorp/yamux"
 )
@@ -21,6 +24,36 @@ type RPCClient struct {
 
 	// These are the streams used for the various stdout/err overrides
 	stdout, stderr net.Conn
+
+	// handshakeConfig is non-nil only when the in-band handshake should be
+	// performed over the raw connection before yamux is created.
+	handshakeConfig *rpcHandshakeConfig
+
+	// handshakeOnce makes sure the handshake is performed at most once, even
+	// if Handshake is called concurrently or repeatedly.
+	handshakeOnce sync.Once
+
+	// The result of a successful handshake. Cached so repeated calls do not
+	// touch the network.
+	negotiatedName    string
+	negotiatedVersion uint32
+	handshakeErr      error
+}
+
+// rpcHandshakeConfig carries the parameters the client presents during the
+// in-band handshake.
+type rpcHandshakeConfig struct {
+	// Name is the plugin name the client expects. Empty disables the name
+	// check.
+	Name string
+
+	// ProtocolVersion is the go-plugin protocol version the client was
+	// configured for.
+	ProtocolVersion uint32
+
+	// Timeout bounds the handshake. A zero value means
+	// defaultHandshakeTimeout.
+	Timeout time.Duration
 }
 
 // newRPCClient creates a new RPCClient. The Client argument is expected
@@ -40,8 +73,25 @@ func newRPCClient(c *Client) (*RPCClient, error) {
 		conn = tls.Client(conn, c.config.TLSConfig)
 	}
 
-	// Create the actual RPC client
-	result, err := NewRPCClient(conn, c.config.Plugins)
+	// Create the actual RPC client. The in-band handshake is enabled when
+	// the client was configured with a plugin name; this is the path used by
+	// the subprocess-managed Client.
+	var handshakeConfig *rpcHandshakeConfig
+	if c.config.Name != "" {
+		version := c.negotiatedVersion
+		if version == 0 {
+			// Reattached clients do not always record the negotiated
+			// version; fall back to the configured one.
+			version = int(c.config.ProtocolVersion)
+		}
+		handshakeConfig = &rpcHandshakeConfig{
+			Name:            c.config.Name,
+			ProtocolVersion: uint32(version),
+			Timeout:         c.config.StartTimeout,
+		}
+	}
+
+	result, err := newRPCClientWithHandshake(conn, c.config.Plugins, handshakeConfig)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -61,7 +111,52 @@ func newRPCClient(c *Client) (*RPCClient, error) {
 
 // NewRPCClient creates a client from an already-open connection-like value.
 // Dial is typically used instead.
+//
+// The connection is assumed to already carry multiplexed traffic; no
+// in-band handshake is performed. This preserves the historical contract,
+// including the yamux stream open order, for callers constructing clients
+// directly.
 func NewRPCClient(conn io.ReadWriteCloser, plugins map[string]Plugin) (*RPCClient, error) {
+	return newRPCClientWithHandshake(conn, plugins, nil)
+}
+
+// newRPCClientWithHandshake creates a client and, when config is non-nil,
+// performs the in-band version and plugin-name handshake on the raw
+// connection before the yamux session is created. On negotiation failure a
+// typed sentinel error (see ErrProtocolMismatch, ErrPluginNameMismatch,
+// ErrHandshakeTimeout and ErrHandshakeInvalidResponse) is returned and the
+// connection is closed.
+func newRPCClientWithHandshake(conn io.ReadWriteCloser, plugins map[string]Plugin, config *rpcHandshakeConfig) (*RPCClient, error) {
+	if config != nil {
+		nextConn, resp, err := clientHandshake(conn, handshakeRequest{
+			ProtocolVersion: config.ProtocolVersion,
+			Name:            config.Name,
+		}, config.Timeout)
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		conn = nextConn
+
+		client, err := newRPCClientFromConn(conn, plugins)
+		if err != nil {
+			return nil, err
+		}
+		client.handshakeConfig = config
+		client.negotiatedName = resp.Name
+		client.negotiatedVersion = resp.ProtocolVersion
+		// Mark the once as done so Handshake returns the cached result.
+		client.handshakeOnce.Do(func() {})
+		return client, nil
+	}
+
+	return newRPCClientFromConn(conn, plugins)
+}
+
+// newRPCClientFromConn builds the yamux session and RPC control client. The
+// yamux stream open order (control first, then the two stdio streams) is
+// unchanged from the original implementation.
+func newRPCClientFromConn(conn io.ReadWriteCloser, plugins map[string]Plugin) (*RPCClient, error) {
 	// Create the yamux client so we can multiplex
 	mux, err := yamux.Client(conn, nil)
 	if err != nil {
@@ -98,6 +193,43 @@ func NewRPCClient(conn io.ReadWriteCloser, plugins map[string]Plugin) (*RPCClien
 		stdout:  stdstream[0],
 		stderr:  stdstream[1],
 	}, nil
+}
+
+// Handshake exchanges protocol version and plugin name with the plugin
+// server and caches the negotiated result.
+//
+// When the client was created through a Client that configured a handshake,
+// the handshake already ran during construction and this call returns the
+// cached result without any network traffic. Clients created with
+// NewRPCClient have no handshake configuration and Handshake returns
+// ErrHandshakeInvalidResponse. It is safe to call concurrently and any
+// number of times: only the first call can perform I/O.
+func (c *RPCClient) Handshake() (name string, protocolVersion uint32, err error) {
+	c.handshakeOnce.Do(func() {
+		if c.handshakeConfig == nil {
+			c.handshakeErr = errors.New("handshake was not configured for this client")
+			return
+		}
+		// This branch is only reachable for clients whose handshake was not
+		// performed at construction time. The yamux session already owns the
+		// raw connection here, so a second in-band exchange is not possible;
+		// construction is the only path that sets a config today.
+		c.handshakeErr = fmt.Errorf("%w: handshake not performed during construction", ErrHandshakeInvalidResponse)
+	})
+
+	return c.negotiatedName, c.negotiatedVersion, c.handshakeErr
+}
+
+// NegotiatedName returns the plugin name returned by the server during the
+// handshake. It is empty if no handshake was performed.
+func (c *RPCClient) NegotiatedName() string {
+	return c.negotiatedName
+}
+
+// NegotiatedProtocolVersion returns the protocol version agreed on during
+// the handshake. It is zero if no handshake was performed.
+func (c *RPCClient) NegotiatedProtocolVersion() uint32 {
+	return c.negotiatedVersion
 }
 
 // SyncStreams should be called to enable syncing of stdout,

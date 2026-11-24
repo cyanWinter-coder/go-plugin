@@ -34,6 +34,16 @@ type RPCServer struct {
 	// when the control requests the RPC server to end.
 	DoneCh chan<- struct{}
 
+	// Name is the plugin name announced during the in-band handshake. An
+	// empty value disables name verification. Legacy clients that do not
+	// perform a handshake are accepted regardless of this field.
+	Name string
+
+	// ProtocolVersions is the set of go-plugin protocol versions this server
+	// supports. An empty set disables version verification during the
+	// handshake.
+	ProtocolVersions map[int]struct{}
+
 	lock sync.Mutex
 }
 
@@ -66,6 +76,23 @@ func (s *RPCServer) Serve(lis net.Listener) {
 //
 // ServeConn blocks, serving the connection until the client hangs up.
 func (s *RPCServer) ServeConn(conn io.ReadWriteCloser) {
+	// Perform the in-band handshake if the client speaks it. Connections
+	// without the magic prefix belong to legacy clients and are forwarded
+	// untouched so the pre-handshake wire behavior is preserved.
+	nextConn, resp, err := serverHandshake(conn, s.Name, s.ProtocolVersions)
+	if err != nil {
+		_ = conn.Close()
+		log.Printf("[ERR] plugin: handshake failed: %s", err)
+		return
+	}
+	if resp != nil && resp.Status != handshakeStatusOK {
+		// The client received a typed rejection; it will close the
+		// connection itself.
+		_ = nextConn.Close()
+		return
+	}
+	conn = nextConn
+
 	// First create the yamux server to wrap this connection
 	mux, err := yamux.Server(conn, nil)
 	if err != nil {
