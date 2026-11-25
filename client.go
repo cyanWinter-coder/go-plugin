@@ -115,6 +115,12 @@ type Client struct {
 
 	grpcMuxerOnce sync.Once
 	grpcMuxer     *grpcmux.GRPCClientMuxer
+
+	// output retains bounded stdout/stderr output for inclusion in startup
+	// and timeout diagnostics.
+	output           *OutputBuffer
+	stdoutLineWriter *prefixLineWriter
+	stderrLineWriter *prefixLineWriter
 }
 
 // NegotiatedVersion returns the protocol version negotiated with the server.
@@ -192,6 +198,12 @@ type ClientConfig struct {
 	// StartTimeout is the timeout to wait for the plugin to say it
 	// has started successfully.
 	StartTimeout time.Duration
+
+	// If non-nil, the raw stdout of the client process will be written here.
+	// The go-plugin handshake line is included because it is part of the
+	// process's stdout stream. Diagnostic output is also retained separately
+	// and exposed through startup errors.
+	Stdout io.Writer
 
 	// If non-nil, then the stderr of the client will be written to here
 	// (as well as the log). This is the original os.Stderr of the subprocess.
@@ -399,6 +411,9 @@ func NewClient(config *ClientConfig) (c *Client) {
 		config.StartTimeout = 1 * time.Minute
 	}
 
+	if config.Stdout == nil {
+		config.Stdout = io.Discard
+	}
 	if config.Stderr == nil {
 		config.Stderr = io.Discard
 	}
@@ -429,7 +444,10 @@ func NewClient(config *ClientConfig) (c *Client) {
 	c = &Client{
 		config: config,
 		logger: config.Logger,
+		output: newOutputBuffer(config.PluginLogBufferSize),
 	}
+	c.stdoutLineWriter = newPrefixLineWriter(c.output, sourceStdout)
+	c.stderrLineWriter = newPrefixLineWriter(c.output, sourceStderr)
 	if config.Managed {
 		managedClientsLock.Lock()
 		managedClients = append(managedClients, c)
@@ -776,7 +794,11 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		// Wait for the command to end.
 		err := runner.Wait(context.Background())
 		if err != nil {
-			c.logger.Error("plugin process exited", "plugin", runner.Name(), "id", runner.ID(), "error", err.Error())
+			args := []any{"plugin", runner.Name(), "id", runner.ID(), "error", err.Error()}
+			if tail := c.outputTail(40); tail != "" {
+				args = append(args, "output_tail", tail)
+			}
+			c.logger.Error("plugin process exited", args...)
 		} else {
 			// Log and make sure to flush the logs right away
 			c.logger.Info("plugin process exited", "plugin", runner.Name(), "id", runner.ID())
@@ -799,13 +821,55 @@ func (c *Client) Start() (addr net.Addr, err error) {
 		defer c.pipesWaitGroup.Done()
 		defer close(linesCh)
 
-		scanner := bufio.NewScanner(runner.Stdout())
+		rawStdout := c.config.Stdout
+		if rawStdout == nil {
+			rawStdout = io.Discard
+		}
+		stdoutCapture := c.stdoutLineWriter
+		if stdoutCapture == nil {
+			stdoutCapture = newPrefixLineWriter(c.output, sourceStdout)
+		}
+		defer func() { _ = stdoutCapture.Flush() }()
+
+		// Tee the raw stream to Config.Stdout while scanning lines for
+		// forwarding and diagnostics.
+		scanner := bufio.NewScanner(io.TeeReader(runner.Stdout(), rawStdout))
 		for scanner.Scan() {
-			linesCh <- scanner.Text()
+			line := scanner.Text()
+			diagnosticLine := redactHandshakeLine(line)
+
+			// Record and forward before hand-off so a startup timeout or exit
+			// diagnostic cannot race ahead of the line that triggered it.
+			_, _ = io.WriteString(stdoutCapture, diagnosticLine+"\n")
+			c.forwardStdoutLine(runner.Name(), diagnosticLine)
+
+			linesCh <- line
 		}
 		if scanner.Err() != nil {
 			c.logger.Error("error encountered while scanning stdout", "error", scanner.Err())
 		}
+	}()
+
+	// On an exited/failed start, terminate the process early so its output
+	// pipes close and every buffered line can be collected before building the
+	// returned diagnostic. Timeouts intentionally do not wait for a stuck
+	// process; they attach whatever tail has already been collected. The
+	// permanent stdout drain is registered below this defer, so it is started
+	// before this function waits on pipesWaitGroup.
+	startTimedOut := false
+	defer func() {
+		if err == nil {
+			return
+		}
+
+		if startTimedOut {
+			err = c.withOutputTail(err)
+			return
+		}
+
+		_ = runner.Kill(context.Background())
+		c.pipesWaitGroup.Wait()
+		err = c.withOutputSnapshot(err)
 	}()
 
 	// Make sure after we exit we read the lines from stdout forever
@@ -828,6 +892,7 @@ func (c *Client) Start() (addr net.Addr, err error) {
 	c.logger.Debug("waiting for RPC address", "plugin", runner.Name())
 	select {
 	case <-timeout:
+		startTimedOut = true
 		err = errors.New("timeout while waiting for plugin to start")
 	case <-c.doneCtx.Done():
 		err = errors.New("plugin exited before we could connect")
@@ -1166,6 +1231,75 @@ func (c *Client) getGRPCMuxer(addr net.Addr) (*grpcmux.GRPCClientMuxer, error) {
 	return c.grpcMuxer, nil
 }
 
+func (c *Client) forwardStdoutLine(name, line string) {
+	c.logger.Named(filepath.Base(name)).Debug("[" + sourceStdout + "] " + line)
+}
+
+// redactHandshakeLine removes the certificate from a captured protocol line.
+// The raw stream written to ClientConfig.Stdout is not modified.
+func redactHandshakeLine(line string) string {
+	parts := strings.Split(line, "|")
+	if len(parts) < 6 {
+		return line
+	}
+	if _, err := strconv.Atoi(parts[0]); err != nil {
+		return line
+	}
+	switch parts[2] {
+	case "tcp", "unix":
+	default:
+		return line
+	}
+	if len(parts[5]) > 0 {
+		parts[5] = "[redacted]"
+	}
+	return strings.Join(parts, "|")
+}
+
+func (c *Client) outputTail(maxLines int) string {
+	if c.output == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.output.TailLines(maxLines))
+}
+
+func (c *Client) outputSnapshot() string {
+	if c.output == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.output.String())
+}
+
+func (c *Client) withOutputTail(err error) error {
+	if err == nil {
+		return nil
+	}
+	// Flush any unterminated final fragment without waiting for the stuck
+	// process to close its output pipes.
+	if c.stdoutLineWriter != nil {
+		_ = c.stdoutLineWriter.Flush()
+	}
+	if c.stderrLineWriter != nil {
+		_ = c.stderrLineWriter.Flush()
+	}
+	tail := c.outputTail(0)
+	if tail == "" {
+		return err
+	}
+	return fmt.Errorf("%w\n\nCollected plugin output tail:\n%s", err, tail)
+}
+
+func (c *Client) withOutputSnapshot(err error) error {
+	if err == nil {
+		return nil
+	}
+	output := c.outputSnapshot()
+	if output == "" {
+		return err
+	}
+	return fmt.Errorf("%w\n\nCollected plugin output:\n%s", err, output)
+}
+
 func (c *Client) logStderr(name string, r io.Reader) {
 	defer c.clientWaitGroup.Done()
 	defer c.pipesWaitGroup.Done()
@@ -1175,6 +1309,20 @@ func (c *Client) logStderr(name string, r io.Reader) {
 	loggerDisabled := loggerLevel == hclog.Off
 
 	reader := bufio.NewReaderSize(r, c.config.PluginLogBufferSize)
+
+	// Capture a source-prefixed copy for startup diagnostics. The raw stream
+	// remains untouched for Config.Stderr and the structured logger below.
+	rawStderr := c.config.Stderr
+	if rawStderr == nil {
+		rawStderr = io.Discard
+	}
+	stderrCapture := c.stderrLineWriter
+	if stderrCapture == nil {
+		stderrCapture = newPrefixLineWriter(c.output, sourceStderr)
+	}
+	stderrOut := io.MultiWriter(rawStderr, stderrCapture)
+	defer func() { _ = stderrCapture.Flush() }()
+
 	// continuation indicates the previous line was a prefix
 	continuation := false
 
@@ -1193,7 +1341,7 @@ func (c *Client) logStderr(name string, r io.Reader) {
 			return
 		}
 
-		_, _ = c.config.Stderr.Write(line)
+		_, _ = stderrOut.Write(line)
 
 		// The line was longer than our max token size, so it's likely
 		// incomplete and won't unmarshal.
@@ -1202,14 +1350,14 @@ func (c *Client) logStderr(name string, r io.Reader) {
 
 			// if we're finishing a continued line, add the newline back in
 			if !isPrefix {
-				_, _ = c.config.Stderr.Write([]byte{'\n'})
+				_, _ = stderrOut.Write([]byte{'\n'})
 			}
 
 			continuation = isPrefix
 			continue
 		}
 
-		_, _ = c.config.Stderr.Write([]byte{'\n'})
+		_, _ = stderrOut.Write([]byte{'\n'})
 
 		//
 		// Any side-effects other than writing to the hclog logger must be
