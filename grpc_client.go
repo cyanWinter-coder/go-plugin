@@ -105,6 +105,14 @@ type GRPCClient struct {
 func (c *GRPCClient) Close() error {
 	_ = c.broker.Close()
 	_, _ = c.controller.Shutdown(c.doneCtx, &plugin.Empty{})
+
+	// The muxer owns the underlying yamux session/connection used by both the
+	// broker and the gRPC client conn. Close it only after the shutdown RPC has
+	// had a chance to use that session.
+	if c.broker != nil && c.broker.muxer != nil && c.broker.muxer.Enabled() {
+		_ = c.broker.muxer.Close()
+	}
+
 	return c.Conn.Close()
 }
 
